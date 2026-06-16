@@ -1,15 +1,19 @@
 from __future__ import annotations
 
 import json
+import importlib
 import os
+import shlex
 import shutil
 import subprocess
 import sys
+import time
 import textwrap
 import uuid
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
-from pathlib import Path
+from pathlib import Path, PurePosixPath
+from typing import Any
 
 import click
 import tomllib
@@ -20,8 +24,8 @@ CONFIG_FILENAME = "quadra.toml"
 STATE_DIRNAME = ".quadra"
 STATE_FILENAME = "state.json"
 RUNTIME_DIRNAME = "runtime"
-STATE_SCHEMA_VERSION = 1
-CONFIG_SCHEMA_VERSION = 1
+STATE_SCHEMA_VERSION = 2
+CONFIG_SCHEMA_VERSION = 2
 DEFAULT_REMOTE_ROOT = "/workspace/projects/{project_name}"
 DEFAULT_IGNORES = {
     ".git",
@@ -48,6 +52,30 @@ class ProjectPaths:
 class RuntimeConfig:
     backend: str
     remote_root: str
+    runpod: "RunpodConfig | None" = None
+
+
+@dataclass(frozen=True)
+class RunpodConfig:
+    api_key_env: str = "RUNPOD_API_KEY"
+    image: str | None = None
+    template_id: str | None = None
+    gpu_type: str | None = None
+    gpu_count: int = 1
+    cloud_type: str = "ALL"
+    ports: str | None = "22/tcp"
+    support_public_ip: bool = True
+    start_ssh: bool = True
+    container_disk_gb: int | None = 10
+    min_vcpu_count: int = 1
+    min_memory_in_gb: int = 1
+    data_center_id: str | None = None
+    network_volume_id: str | None = None
+    network_volume_name: str | None = None
+    volume_mount_path: str | None = None
+    instance_id: str | None = None
+    allowed_cuda_versions: tuple[str, ...] = ()
+    timeout_seconds: int = 300
 
 
 @dataclass(frozen=True)
@@ -95,11 +123,20 @@ class ProjectConfig:
 @dataclass
 class RuntimeState:
     schema_version: int = STATE_SCHEMA_VERSION
+    backend: str | None = None
     active_runtime_id: str | None = None
     last_runtime_id: str | None = None
     created_at: str | None = None
     last_sync_at: str | None = None
     last_command: str | None = None
+    pod_id: str | None = None
+    pod_name: str | None = None
+    pod_status: str | None = None
+    volume_id: str | None = None
+    volume_name: str | None = None
+    ssh_host: str | None = None
+    ssh_port: int | None = None
+    public_ports: list[dict[str, Any]] = field(default_factory=list)
 
 
 class QuadraError(RuntimeError):
@@ -113,6 +150,27 @@ def now_utc() -> str:
 def runtime_id() -> str:
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     return f"{stamp}-{uuid.uuid4().hex[:8]}"
+
+
+def optional_str(value: object | None) -> str | None:
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text or None
+
+
+def normalize_allowed_cuda_versions(value: object | None) -> tuple[str, ...]:
+    if value is None:
+        return ()
+    if isinstance(value, str):
+        return tuple(part.strip() for part in value.split(",") if part.strip())
+    if isinstance(value, list):
+        return tuple(str(part).strip() for part in value if str(part).strip())
+    raise QuadraError("runtime.runpod.allowed_cuda_versions must be a list or comma-separated string.")
+
+
+def is_runpod_backend(config: ProjectConfig) -> bool:
+    return config.runtime.backend == "runpod"
 
 
 def find_project_root(start: Path | None = None) -> Path:
