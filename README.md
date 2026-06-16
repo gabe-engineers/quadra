@@ -18,9 +18,20 @@ quadra run smoke
 quadra shell
 quadra destroy
 quadra hard-run smoke
+
+mkdir bonsai
+cd bonsai
+quadra init
 ```
 
+Build a standalone CLI executable with `just build-cli`. The binary will be written to `dist/quadra`.
+Install it via symlink with `just install-cli`, which links `dist/quadra` into `~/.local/bin/quadra`.
+
+`quadra init` also works without a name. In that case it scaffolds into the current directory, uses the directory name as the project name, and leaves unrelated existing files alone.
+
 `hard-run` is the end-to-end loop: destroy any existing runtime, create a fresh one, sync the project, run the command, then tear the runtime down.
+
+Quadra currently targets RunPod only. Configure the `[runtime.runpod]` block in `quadra.toml`, export `RUNPOD_API_KEY`, and `quadra up` will provision or rediscover the project pod by name, attach the configured network volume, and wait for SSH readiness.
 
 ## Project Contract
 
@@ -46,6 +57,6 @@ quadra hard-run smoke
   .quadra/
 ```
 
-The logical remote root is `/workspace/projects/<project_name>`.
+The logical remote root is `/workspace/<project_name>`.
 
-For the MVP, Quadra stages the synced remote workspace under `.quadra/runtime/<runtime_id>/...` so `run` and `shell` execute against the synced copy instead of the source tree.
+`sync`, `run`, and `shell` all target the live RunPod pod over SSH.
