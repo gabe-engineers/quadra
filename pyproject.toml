@@ -9,7 +9,9 @@ description = "Quadra owns the project/runtime lifecycle for experiments."
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
+  "boto3>=1.34,<2",
   "click>=8.1,<9",
+  "requests>=2,<3",
   "runpod>=1.9.1",
 ]
 
@@ -23,6 +25,9 @@ quadra = "quadra.cli:cli"
 
 [tool.setuptools]
 package-dir = {"" = "src"}
+
+[tool.setuptools.package-data]
+quadra = ["assets/*.ansi", "assets/*.txt"]
 
 [tool.setuptools.packages.find]
 where = ["src"]

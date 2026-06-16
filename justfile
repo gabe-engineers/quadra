@@ -10,6 +10,7 @@ build-cli out_dir="dist":
       --onefile \
       --name quadra \
       --paths src \
+      --add-data "$PWD/src/quadra/assets:quadra/assets" \
       --distpath {{out_dir}} \
       --workpath .quadra/build/pyinstaller/work \
       --specpath .quadra/build/pyinstaller/spec \
