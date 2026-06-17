@@ -49,7 +49,7 @@ quadra init
 - `quadra logs` streams logs for the most recently submitted run.
 - `quadra pull [run_id] [destination]` downloads a completed run into `runs/<run_id>/`.
 - `quadra smoke` and `quadra bench` run the full sync-submit-logs-pull loop for the named workflow.
-- `quadra gpus` lists currently available RunPod serverless GPU pool IDs and prices.
+  They print sync, submit, polling, and pull progress as they run.
 
 ## RunPod Serverless Model
 
@@ -57,7 +57,9 @@ Quadra targets RunPod Serverless only.
 
 - Project sync and artifact pull use the RunPod S3-compatible API against the configured network volume.
 - `quadra init` writes valid serverless `gpu_ids` pool values into `quadra.toml` as inline comments.
+- `quadra init` also writes a `quadra_worker.py` worker script plus a configurable `[runtime.runpod.template]` block.
 - The remote project directory defaults to `/runpod-volume/projects/<project_name>`.
+- The first `submit` creates the configured RunPod template and endpoint if they do not already exist.
 - `submit` sends a workflow job to a persistent Serverless endpoint.
 - `logs` uses the saved local run reference to follow the latest submission.
 - `pull` downloads the remote run directory back into the local project.
@@ -66,17 +68,21 @@ Your network volume must live in a RunPod datacenter that supports the S3-compat
 
 ## Worker Contract
 
-Quadra submits jobs that assume the endpoint template uses:
+By default, Quadra creates a serverless template that starts:
 
-```python
-quadra.serverless_worker:handler
+```bash
+python -u /runpod-volume/projects/<project_name>/quadra_worker.py
 ```
 
-That handler expects a network volume mounted at `/runpod-volume`, runs the configured setup command, executes the workflow inside `src/experiment`, and writes logs, status, and artifacts under:
+That worker script is scaffolded into the project root by `quadra init`, synced into the network volume by `quadra sync`, and can be replaced by editing `[runtime.runpod.template]` in `quadra.toml`.
+
+The default worker expects a network volume mounted at `/runpod-volume`, runs the configured setup command, executes the workflow inside `src/experiment`, and writes logs, status, and artifacts under:
 
 ```text
 /runpod-volume/projects/<project_name>/runs/<run_id>/
 ```
+
+`timeout_seconds` in `runtime.runpod` is applied to the endpoint execution timeout when Quadra creates the endpoint.
 
 ## Build And Install
 
@@ -103,6 +109,7 @@ That command symlinks `dist/quadra` to `~/.local/bin/quadra`.
 ```text
 <project>/
   quadra.toml
+  quadra_worker.py
   src/
     libs/
       diffusers/

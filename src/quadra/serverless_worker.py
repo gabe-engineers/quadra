@@ -161,3 +161,18 @@ def handler(job: dict[str, Any]) -> dict[str, Any]:
         "run_dir": str(run_dir),
         "artifacts_dir": str(artifacts_dir),
     }
+
+
+def main() -> None:
+    try:
+        import runpod
+    except ImportError as exc:
+        raise RuntimeError(
+            "The worker image is missing the `runpod` package required for serverless startup."
+        ) from exc
+
+    runpod.serverless.start({"handler": handler})
+
+
+if __name__ == "__main__":
+    main()

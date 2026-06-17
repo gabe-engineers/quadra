@@ -68,6 +68,8 @@ class FakeRunpodClient:
             "dataCenterId": data_center_id,
         }
         self.endpoints: list[dict[str, object]] = []
+        self.templates: list[dict[str, object]] = []
+        self.created_templates: list[dict[str, object]] = []
         self.created_endpoints: list[dict[str, object]] = []
         self.jobs: dict[str, dict[str, object]] = {}
         self.submissions: list[dict[str, object]] = []
@@ -77,6 +79,15 @@ class FakeRunpodClient:
 
     def get_endpoints(self) -> list[dict[str, object]]:
         return list(self.endpoints)
+
+    def get_templates(self) -> list[dict[str, object]]:
+        return list(self.templates)
+
+    def create_template(self, **kwargs: object) -> dict[str, object]:
+        self.created_templates.append(kwargs)
+        template = {"id": "tpl-123", "name": kwargs["name"]}
+        self.templates.append(template)
+        return template
 
     def create_endpoint(self, **kwargs: object) -> dict[str, object]:
         self.created_endpoints.append(kwargs)
@@ -120,6 +131,62 @@ class FakeRunpodClient:
         return str(PurePosixPath(run_dir).relative_to("/runpod-volume"))
 
 
+class PollingFakeRunpodClient(FakeRunpodClient):
+    def __init__(self, s3: FakeS3Client, *, data_center_id: str = "US-IL-1") -> None:
+        super().__init__(s3, data_center_id=data_center_id)
+        self.job_poll_counts: dict[str, int] = {}
+        self.job_run_prefixes: dict[str, str] = {}
+        self.job_workflows: dict[str, str] = {}
+        self.job_run_ids: dict[str, str] = {}
+
+    def run_job(self, endpoint_id: str, request_input: dict[str, object]) -> dict[str, object]:
+        payload = request_input["quadra"]
+        run_id = str(payload["run_id"])
+        workflow = str(payload["workflow"])
+        job_id = f"job-{len(self.submissions) + 1}"
+        self.submissions.append({"endpoint_id": endpoint_id, "payload": request_input})
+
+        self.job_poll_counts[job_id] = 0
+        self.job_run_ids[job_id] = run_id
+        self.job_workflows[job_id] = workflow
+        self.job_run_prefixes[job_id] = self.remote_key_prefix(str(payload["run_dir"]))
+        self.jobs[job_id] = {
+            "id": job_id,
+            "status": "IN_QUEUE",
+            "output": {"run_id": run_id},
+        }
+        return {"id": job_id}
+
+    def get_job(self, endpoint_id: str, job_id: str, *, source: str = "status") -> dict[str, object]:
+        del endpoint_id, source
+        poll_count = self.job_poll_counts[job_id]
+        self.job_poll_counts[job_id] = poll_count + 1
+
+        if poll_count == 0:
+            status = "IN_QUEUE"
+        elif poll_count == 1:
+            status = "IN_PROGRESS"
+        else:
+            status = "COMPLETED"
+            run_prefix = self.job_run_prefixes[job_id]
+            workflow = self.job_workflows[job_id]
+            run_id = self.job_run_ids[job_id]
+            self.s3.objects[posixpath.join(run_prefix, "stdout.log")] = (
+                f"bonsai {workflow} remote\n".encode("utf-8")
+            )
+            self.s3.objects[posixpath.join(run_prefix, "stderr.log")] = b""
+            self.s3.objects[posixpath.join(run_prefix, "status.json")] = json.dumps(
+                {
+                    "run_id": run_id,
+                    "status": "completed",
+                    "exit_code": 0,
+                }
+            ).encode("utf-8")
+
+        self.jobs[job_id]["status"] = status
+        return dict(self.jobs[job_id])
+
+
 class QuadraCLITestCase(unittest.TestCase):
     def setUp(self) -> None:
         self.runner = CliRunner()
@@ -151,10 +218,20 @@ class QuadraCLITestCase(unittest.TestCase):
             config = (project_root / "quadra.toml").read_text(encoding="utf-8")
             self.assertIn('project_dir = "/runpod-volume/projects/bonsai"', config)
             self.assertIn('endpoint_name = "quadra-bonsai"', config)
-            self.assertIn('template_id = ""', config)
+            self.assertIn('[runtime.runpod.template]', config)
+            self.assertIn('name = "quadra-bonsai-worker"', config)
+            self.assertIn(
+                'docker_start_cmd = ["python", "-u", "{worker_path}"]',
+                config,
+            )
             self.assertIn("# Valid serverless gpu_ids pool IDs:", config)
             self.assertIn('#   ADA_24        24 GB    RTX 4090', config)
+            self.assertIn(
+                '#   ADA_32_PRO    32 GB    RTX 5000 Ada, RTX PRO 4500 Blackwell',
+                config,
+            )
             self.assertTrue((project_root / ".quadra").exists())
+            self.assertTrue((project_root / "quadra_worker.py").exists())
             self.assertTrue((project_root / "src" / "experiment" / "scripts" / "smoke.py").exists())
 
     def test_init_without_name_uses_current_directory_name(self) -> None:
@@ -189,7 +266,6 @@ class QuadraCLITestCase(unittest.TestCase):
             fake_client = FakeRunpodClient(fake_s3)
 
             with chdir("bonsai"):
-                self.write_template_id(Path("quadra.toml"))
                 with patch("quadra.cli.load_runpod_client", return_value=fake_client):
                     with patch("quadra.cli.build_s3_client", return_value=fake_s3):
                         result = self.runner.invoke(cli, ["submit", "smoke"])
@@ -206,7 +282,6 @@ class QuadraCLITestCase(unittest.TestCase):
             fake_client = FakeRunpodClient(fake_s3)
 
             with chdir("bonsai"):
-                self.write_template_id(Path("quadra.toml"))
                 with patch("quadra.cli.load_runpod_client", return_value=fake_client):
                     with patch("quadra.cli.build_s3_client", return_value=fake_s3):
                         sync_result = self.runner.invoke(cli, ["sync"])
@@ -219,7 +294,19 @@ class QuadraCLITestCase(unittest.TestCase):
                         self.assertIn("submitted smoke", submit_result.output)
                         self.assertIn("endpoint_id: ep-123", submit_result.output)
                         self.assertTrue(Path(".quadra/last-run.json").exists())
+                        self.assertEqual(len(fake_client.created_templates), 1)
                         self.assertEqual(len(fake_client.created_endpoints), 1)
+                        self.assertEqual(
+                            fake_client.created_templates[0]["docker_start_cmd"],
+                            (
+                                "python",
+                                "-u",
+                                "/runpod-volume/projects/bonsai/quadra_worker.py",
+                            ),
+                        )
+                        self.assertEqual(
+                            fake_client.created_endpoints[0]["timeout_seconds"], 600
+                        )
 
                         logs_result = self.runner.invoke(cli, ["logs", "--no-follow"])
                         self.assertEqual(logs_result.exit_code, 0, logs_result.output)
@@ -235,13 +322,61 @@ class QuadraCLITestCase(unittest.TestCase):
                             "bonsai smoke remote\n",
                         )
 
-    def write_template_id(self, config_path: Path) -> None:
-        config = config_path.read_text(encoding="utf-8")
-        config_path.write_text(
-            config.replace('template_id = ""', 'template_id = "tpl-123"'),
-            encoding="utf-8",
-        )
+    def test_smoke_reports_polling_progress(self) -> None:
+        with self.runner.isolated_filesystem():
+            init_result = self.runner.invoke(cli, ["init", "bonsai"])
+            self.assertEqual(init_result.exit_code, 0, init_result.output)
 
+            fake_s3 = FakeS3Client()
+            fake_client = PollingFakeRunpodClient(fake_s3)
+
+            with chdir("bonsai"):
+                with patch("quadra.cli.load_runpod_client", return_value=fake_client):
+                    with patch("quadra.cli.build_s3_client", return_value=fake_s3):
+                        with patch("quadra.cli.time.sleep", return_value=None):
+                            result = self.runner.invoke(cli, ["smoke"])
+
+            self.assertEqual(result.exit_code, 0, result.output)
+            self.assertIn("polling RunPod job status and remote logs...", result.output)
+            self.assertIn("[quadra] smoke: queued on RunPod", result.output)
+            self.assertIn(
+                "[quadra] smoke: worker running, waiting for remote logs",
+                result.output,
+            )
+            self.assertIn("[quadra] smoke: completed", result.output)
+            self.assertIn("pulling artifacts for", result.output)
+
+    def test_submit_accepts_legacy_top_level_template_id(self) -> None:
+        with self.runner.isolated_filesystem():
+            init_result = self.runner.invoke(cli, ["init", "bonsai"])
+            self.assertEqual(init_result.exit_code, 0, init_result.output)
+
+            fake_s3 = FakeS3Client()
+            fake_client = FakeRunpodClient(fake_s3)
+
+            with chdir("bonsai"):
+                config_path = Path("quadra.toml")
+                config = config_path.read_text(encoding="utf-8")
+                config_path.write_text(
+                    config.replace(
+                        'endpoint_name = "quadra-bonsai"',
+                        'endpoint_name = "quadra-bonsai"\ntemplate_id = "tpl-existing"',
+                    ),
+                    encoding="utf-8",
+                )
+
+                with patch("quadra.cli.load_runpod_client", return_value=fake_client):
+                    with patch("quadra.cli.build_s3_client", return_value=fake_s3):
+                        sync_result = self.runner.invoke(cli, ["sync"])
+                        self.assertEqual(sync_result.exit_code, 0, sync_result.output)
+
+                        submit_result = self.runner.invoke(cli, ["submit", "smoke"])
+                        self.assertEqual(submit_result.exit_code, 0, submit_result.output)
+                        self.assertEqual(len(fake_client.created_templates), 0)
+                        self.assertEqual(
+                            fake_client.created_endpoints[0]["template_id"],
+                            "tpl-existing",
+                        )
 
 if __name__ == "__main__":
     unittest.main()

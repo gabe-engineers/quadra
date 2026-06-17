@@ -26,8 +26,12 @@ CONFIG_SCHEMA_VERSION = 3
 RUNPOD_VOLUME_ROOT = PurePosixPath("/runpod-volume")
 DEFAULT_PROJECT_DIR = "/runpod-volume/projects/{project_name}"
 DEFAULT_RUNPOD_API_BASE_URL = "https://api.runpod.io"
+DEFAULT_RUNPOD_REST_API_BASE_URL = "https://rest.runpod.io/v1"
 DEFAULT_RUNPOD_ENDPOINT_BASE_URL = "https://api.runpod.ai/v2"
 FINAL_JOB_STATES = {"COMPLETED", "FAILED", "TIMED_OUT", "CANCELLED"}
+POLL_PROGRESS_INTERVAL_SECONDS = 10
+QUADRA_WORKER_FILENAME = "quadra_worker.py"
+DEFAULT_TEMPLATE_IMAGE = "runpod/base:0.6.1-cuda12.4.1"
 BANNER_ASSET_DIR = importlib.resources.files("quadra").joinpath("assets")
 BANNER_TAGLINE = "\n".join(
     [
@@ -72,7 +76,7 @@ SERVERLESS_GPU_POOL_COMMENT_LINES = (
     "#   AMPERE_80     80 GB    A100",
     "#   ADA_80_PRO    80 GB    H100",
     "#   HOPPER_141    141 GB   H200",
-    "#   ADA_32_PRO    32 GB    RTX 5000 Ada",
+    "#   ADA_32_PRO    32 GB    RTX 5000 Ada, RTX PRO 4500 Blackwell",
     "#   BLACKWELL_96  96 GB    RTX PRO 6000 Blackwell",
     "#   BLACKWELL_180 180 GB   B200",
 )
@@ -88,11 +92,23 @@ class ProjectPaths:
 
 
 @dataclass(frozen=True)
+class RunpodTemplateConfig:
+    id: str | None
+    name: str
+    image_name: str
+    ports: tuple[str, ...] = ()
+    docker_entrypoint: tuple[str, ...] = ()
+    docker_start_cmd: tuple[str, ...] = ()
+    env: dict[str, str] = field(default_factory=dict)
+    container_disk_gb: int = 20
+    readme: str = ""
+
+
+@dataclass(frozen=True)
 class RunpodConfig:
     api_key_env: str = "RUNPOD_API_KEY"
     endpoint_id: str | None = None
     endpoint_name: str | None = None
-    template_id: str | None = None
     gpu_ids: str = "AMPERE_16"
     gpu_count: int = 1
     workers_min: int = 0
@@ -108,6 +124,13 @@ class RunpodConfig:
     timeout_seconds: int = 600
     s3_access_key_env: str | None = "AWS_ACCESS_KEY_ID"
     s3_secret_key_env: str | None = "AWS_SECRET_ACCESS_KEY"
+    template: RunpodTemplateConfig = field(
+        default_factory=lambda: RunpodTemplateConfig(
+            id=None,
+            name="quadra-worker",
+            image_name=DEFAULT_TEMPLATE_IMAGE,
+        )
+    )
 
 
 @dataclass(frozen=True)
@@ -150,6 +173,24 @@ class VolumeHandle:
 class EndpointHandle:
     id: str
     name: str
+
+
+@dataclass(frozen=True)
+class TemplateHandle:
+    id: str
+    name: str
+
+
+@dataclass(frozen=True)
+class TemplateSpec:
+    name: str
+    image_name: str
+    ports: tuple[str, ...]
+    docker_entrypoint: tuple[str, ...]
+    docker_start_cmd: tuple[str, ...]
+    env: dict[str, str]
+    container_disk_gb: int
+    readme: str
 
 
 @dataclass(frozen=True)
@@ -212,6 +253,9 @@ class RunpodHttpClient:
         self.api_key = api_key
         self.api_base_url = os.getenv(
             "RUNPOD_API_BASE_URL", DEFAULT_RUNPOD_API_BASE_URL
+        )
+        self.rest_api_base_url = os.getenv(
+            "RUNPOD_REST_API_BASE_URL", DEFAULT_RUNPOD_REST_API_BASE_URL
         )
         self.endpoint_url_base = os.getenv(
             "RUNPOD_ENDPOINT_BASE_URL", DEFAULT_RUNPOD_ENDPOINT_BASE_URL
@@ -300,6 +344,7 @@ class RunpodHttpClient:
         flashboot: bool,
         allowed_cuda_versions: tuple[str, ...],
         gpu_count: int,
+        timeout_seconds: int,
     ) -> dict[str, Any]:
         query = runpod_create_endpoint_mutation(
             name=name,
@@ -315,8 +360,51 @@ class RunpodHttpClient:
             flashboot=flashboot,
             allowed_cuda_versions=allowed_cuda_versions,
             gpu_count=gpu_count,
+            execution_timeout_ms=max(timeout_seconds, 0) * 1000,
         )
         return self.run_graphql_query(query)["data"]["saveEndpoint"]
+
+    def get_templates(self) -> list[dict[str, Any]]:
+        payload = self._request("GET", f"{self.rest_api_base_url}/templates")
+        if not isinstance(payload, list):
+            raise QuadraError("RunPod returned an invalid template list response.")
+        return [item for item in payload if isinstance(item, dict)]
+
+    def create_template(
+        self,
+        *,
+        name: str,
+        image_name: str,
+        ports: tuple[str, ...],
+        docker_entrypoint: tuple[str, ...],
+        docker_start_cmd: tuple[str, ...],
+        env: dict[str, str],
+        container_disk_gb: int,
+        readme: str,
+    ) -> dict[str, Any]:
+        payload: dict[str, Any] = {
+            "name": name,
+            "imageName": image_name,
+            "isServerless": True,
+            "containerDiskInGb": container_disk_gb,
+        }
+        if ports:
+            payload["ports"] = list(ports)
+        if docker_entrypoint:
+            payload["dockerEntrypoint"] = list(docker_entrypoint)
+        if docker_start_cmd:
+            payload["dockerStartCmd"] = list(docker_start_cmd)
+        if env:
+            payload["env"] = env
+        if readme:
+            payload["readme"] = readme
+
+        response = self._request(
+            "POST", f"{self.rest_api_base_url}/templates", payload=payload
+        )
+        if not isinstance(response, dict):
+            raise QuadraError("RunPod returned an invalid template create response.")
+        return response
 
     def run_job(self, endpoint_id: str, request_input: dict[str, Any]) -> dict[str, Any]:
         if "input" not in request_input:
@@ -341,12 +429,13 @@ class RunpodSdkClient:
         self.runpod = runpod_module
         self.runpod.api_key = api_key
         self.api_key = api_key
+        self.http_client = RunpodHttpClient(api_key)
 
     def get_user(self) -> dict[str, Any]:
-        return self.runpod.get_user()
+        return self.http_client.get_user()
 
     def get_endpoints(self) -> list[dict[str, Any]]:
-        return self.runpod.get_endpoints()
+        return self.http_client.get_endpoints()
 
     def create_endpoint(
         self,
@@ -364,8 +453,9 @@ class RunpodSdkClient:
         flashboot: bool,
         allowed_cuda_versions: tuple[str, ...],
         gpu_count: int,
+        timeout_seconds: int,
     ) -> dict[str, Any]:
-        return self.runpod.create_endpoint(
+        return self.http_client.create_endpoint(
             name=name,
             template_id=template_id,
             gpu_ids=gpu_ids,
@@ -377,8 +467,35 @@ class RunpodSdkClient:
             workers_min=workers_min,
             workers_max=workers_max,
             flashboot=flashboot,
-            allowed_cuda_versions=",".join(allowed_cuda_versions) or None,
+            allowed_cuda_versions=allowed_cuda_versions,
             gpu_count=gpu_count,
+            timeout_seconds=timeout_seconds,
+        )
+
+    def get_templates(self) -> list[dict[str, Any]]:
+        return self.http_client.get_templates()
+
+    def create_template(
+        self,
+        *,
+        name: str,
+        image_name: str,
+        ports: tuple[str, ...],
+        docker_entrypoint: tuple[str, ...],
+        docker_start_cmd: tuple[str, ...],
+        env: dict[str, str],
+        container_disk_gb: int,
+        readme: str,
+    ) -> dict[str, Any]:
+        return self.http_client.create_template(
+            name=name,
+            image_name=image_name,
+            ports=ports,
+            docker_entrypoint=docker_entrypoint,
+            docker_start_cmd=docker_start_cmd,
+            env=env,
+            container_disk_gb=container_disk_gb,
+            readme=readme,
         )
 
     def run_job(self, endpoint_id: str, request_input: dict[str, Any]) -> dict[str, Any]:
@@ -403,6 +520,13 @@ def now_utc() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def parse_utc_timestamp(value: str) -> datetime | None:
+    try:
+        return datetime.fromisoformat(value)
+    except ValueError:
+        return None
+
+
 def generate_run_id() -> str:
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     return f"{stamp}-{uuid.uuid4().hex[:8]}"
@@ -413,6 +537,33 @@ def optional_str(value: object | None) -> str | None:
         return None
     text = str(value).strip()
     return text or None
+
+
+def normalize_str_sequence(value: object | None, field_name: str) -> tuple[str, ...]:
+    if value is None:
+        return ()
+    if isinstance(value, str):
+        text = value.strip()
+        return (text,) if text else ()
+    if isinstance(value, list):
+        values: list[str] = []
+        for item in value:
+            text = str(item).strip()
+            if text:
+                values.append(text)
+        return tuple(values)
+    raise QuadraError(f"{field_name} must be a string or list of strings.")
+
+
+def normalize_string_map(value: object | None, field_name: str) -> dict[str, str]:
+    if value is None:
+        return {}
+    if not isinstance(value, dict):
+        raise QuadraError(f"{field_name} must be a table or inline table.")
+    normalized: dict[str, str] = {}
+    for key, item in value.items():
+        normalized[str(key)] = str(item)
+    return normalized
 
 
 def normalize_allowed_cuda_versions(value: object | None) -> tuple[str, ...]:
@@ -487,6 +638,7 @@ def runpod_create_endpoint_mutation(
     flashboot: bool,
     allowed_cuda_versions: tuple[str, ...],
     gpu_count: int,
+    execution_timeout_ms: int,
 ) -> str:
     fields = []
     if flashboot:
@@ -511,6 +663,8 @@ def runpod_create_endpoint_mutation(
         fields.append(
             f"allowedCudaVersions: {graphql_string(','.join(allowed_cuda_versions))}"
         )
+    if execution_timeout_ms:
+        fields.append(f"executionTimeoutMs: {execution_timeout_ms}")
 
     return f"""
     mutation {{
@@ -532,6 +686,7 @@ def runpod_create_endpoint_mutation(
         workersMin
         workersMax
         flashBootType
+        executionTimeoutMs
       }}
     }}
     """
@@ -566,11 +721,48 @@ def load_project(start: Path | None = None) -> ProjectConfig:
     if not isinstance(runpod_data, dict):
         raise QuadraError("Missing required config section: runtime.runpod")
 
+    project_name = str(project["name"])
+    project_dir = str(runtime["project_dir"])
+    template_data = runpod_data.get("template")
+    if template_data is None:
+        template_data = {}
+    if not isinstance(template_data, dict):
+        raise QuadraError("runtime.runpod.template must be a table.")
+
+    template_config = RunpodTemplateConfig(
+        id=optional_str(template_data.get("id"))
+        or optional_str(runpod_data.get("template_id")),
+        name=optional_str(template_data.get("name"))
+        or f"quadra-{project_name}-worker",
+        image_name=str(template_data.get("image_name", DEFAULT_TEMPLATE_IMAGE)).strip(),
+        ports=normalize_str_sequence(
+            template_data.get("ports"), "runtime.runpod.template.ports"
+        ),
+        docker_entrypoint=normalize_str_sequence(
+            template_data.get("docker_entrypoint"),
+            "runtime.runpod.template.docker_entrypoint",
+        ),
+        docker_start_cmd=normalize_str_sequence(
+            template_data.get("docker_start_cmd")
+            or ["python", "-u", "{worker_path}"],
+            "runtime.runpod.template.docker_start_cmd",
+        ),
+        env=normalize_string_map(
+            template_data.get("env"), "runtime.runpod.template.env"
+        ),
+        container_disk_gb=int(template_data.get("container_disk_gb", 20)),
+        readme=str(
+            template_data.get(
+                "readme",
+                "Managed by Quadra. Runs {worker_path} from the synced project volume.",
+            )
+        ),
+    )
+
     runpod_config = RunpodConfig(
         api_key_env=str(runpod_data.get("api_key_env", "RUNPOD_API_KEY")),
         endpoint_id=optional_str(runpod_data.get("endpoint_id")),
         endpoint_name=optional_str(runpod_data.get("endpoint_name")),
-        template_id=optional_str(runpod_data.get("template_id")),
         gpu_ids=str(runpod_data.get("gpu_ids", "AMPERE_16")).strip(),
         gpu_count=int(runpod_data.get("gpu_count", 1)),
         workers_min=int(runpod_data.get("workers_min", 0)),
@@ -592,6 +784,7 @@ def load_project(start: Path | None = None) -> ProjectConfig:
         s3_secret_key_env=optional_str(
             runpod_data.get("s3_secret_key_env", "AWS_SECRET_ACCESS_KEY")
         ),
+        template=template_config,
     )
 
     return ProjectConfig(
@@ -606,7 +799,7 @@ def load_project(start: Path | None = None) -> ProjectConfig:
             runs=str(paths["runs"]),
         ),
         runtime=RuntimeConfig(
-            project_dir=str(runtime["project_dir"]),
+            project_dir=project_dir,
             setup_command=optional_str(runtime.get("setup_command", "uv sync")),
             runpod=runpod_config,
         ),
@@ -631,6 +824,7 @@ def init_project(
     ]
     scaffold_files = [
         target_root / CONFIG_FILENAME,
+        target_root / QUADRA_WORKER_FILENAME,
         target_root / "src" / "experiment" / "pyproject.toml",
         target_root / "src" / "experiment" / "main.py",
         target_root / "src" / "experiment" / "scripts" / "smoke.py",
@@ -656,13 +850,14 @@ def init_project(
             (keep_dir / ".gitkeep").write_text("", encoding="utf-8")
 
     scaffold_files[0].write_text(render_quadra_config(project_name), encoding="utf-8")
-    scaffold_files[1].write_text(
+    scaffold_files[1].write_text(render_project_worker_py(), encoding="utf-8")
+    scaffold_files[2].write_text(
         render_experiment_pyproject(project_name),
         encoding="utf-8",
     )
-    scaffold_files[2].write_text(render_main_py(project_name), encoding="utf-8")
-    scaffold_files[3].write_text(render_smoke_py(project_name), encoding="utf-8")
-    scaffold_files[4].write_text(render_bench_py(project_name), encoding="utf-8")
+    scaffold_files[3].write_text(render_main_py(project_name), encoding="utf-8")
+    scaffold_files[4].write_text(render_smoke_py(project_name), encoding="utf-8")
+    scaffold_files[5].write_text(render_bench_py(project_name), encoding="utf-8")
 
 
 def render_quadra_config(project_name: str) -> str:
@@ -689,7 +884,6 @@ def render_quadra_config(project_name: str) -> str:
         [runtime.runpod]
         api_key_env = "RUNPOD_API_KEY"
         endpoint_name = "quadra-{project_name}"
-        template_id = ""
         {gpu_pool_comments}
         gpu_ids = "AMPERE_16"
         gpu_count = 1
@@ -703,6 +897,16 @@ def render_quadra_config(project_name: str) -> str:
         s3_access_key_env = "AWS_ACCESS_KEY_ID"
         s3_secret_key_env = "AWS_SECRET_ACCESS_KEY"
         timeout_seconds = 600
+
+        [runtime.runpod.template]
+        id = ""
+        name = "quadra-{project_name}-worker"
+        image_name = "{DEFAULT_TEMPLATE_IMAGE}"
+        # Template string tokens: {{project_name}}, {{project_dir}}, {{worker_path}}
+        docker_start_cmd = ["python", "-u", "{{worker_path}}"]
+        container_disk_gb = 20
+        env = {{}}
+        readme = "Managed by Quadra. Runs {{worker_path}} from the synced project volume."
 
         [commands]
         smoke = "python scripts/smoke.py"
@@ -719,6 +923,200 @@ def render_experiment_pyproject(project_name: str) -> str:
         name = "{project_name}-experiment"
         version = "0.1.0"
         requires-python = ">=3.11"
+        """
+    )
+
+
+def render_project_worker_py() -> str:
+    return textwrap.dedent(
+        """\
+        from __future__ import annotations
+
+        import json
+        import os
+        import subprocess
+        import time
+        from pathlib import Path
+        from typing import Any
+
+        import runpod
+
+
+        def _now() -> str:
+            return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+
+        def _write_status(path: Path, payload: dict[str, Any]) -> None:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(
+                json.dumps(payload, indent=2, sort_keys=True) + "\\n",
+                encoding="utf-8",
+            )
+
+
+        def _run_shell(
+            command: str,
+            *,
+            cwd: Path,
+            env: dict[str, str],
+            stdout_path: Path,
+            stderr_path: Path,
+        ) -> subprocess.CompletedProcess[str]:
+            stdout_path.parent.mkdir(parents=True, exist_ok=True)
+            stderr_path.parent.mkdir(parents=True, exist_ok=True)
+            with stdout_path.open("a", encoding="utf-8") as stdout_handle:
+                with stderr_path.open("a", encoding="utf-8") as stderr_handle:
+                    return subprocess.run(
+                        ["/bin/sh", "-lc", command],
+                        cwd=str(cwd),
+                        env=env,
+                        stdout=stdout_handle,
+                        stderr=stderr_handle,
+                        text=True,
+                        check=False,
+                    )
+
+
+        def handler(job: dict[str, Any]) -> dict[str, Any]:
+            payload = (job or {}).get("input") or {}
+            spec = payload.get("quadra") if isinstance(payload.get("quadra"), dict) else payload
+
+            required = [
+                "project_name",
+                "run_id",
+                "project_dir",
+                "experiment_dir",
+                "run_dir",
+                "command",
+            ]
+            missing = [key for key in required if not spec.get(key)]
+            if missing:
+                raise ValueError(
+                    f"Missing required Quadra payload fields: {', '.join(missing)}"
+                )
+
+            project_name = str(spec["project_name"])
+            run_id = str(spec["run_id"])
+            workflow = str(spec.get("workflow", spec["command"]))
+            project_dir = Path(str(spec["project_dir"]))
+            experiment_dir = Path(str(spec["experiment_dir"]))
+            run_dir = Path(str(spec["run_dir"]))
+            artifacts_dir = Path(str(spec.get("artifacts_dir", run_dir / "artifacts")))
+            stdout_path = run_dir / "stdout.log"
+            stderr_path = run_dir / "stderr.log"
+            status_path = run_dir / "status.json"
+
+            run_dir.mkdir(parents=True, exist_ok=True)
+            artifacts_dir.mkdir(parents=True, exist_ok=True)
+
+            env = os.environ.copy()
+            env.update({str(key): str(value) for key, value in (spec.get("env") or {}).items()})
+
+            status_payload = {
+                "project_name": project_name,
+                "run_id": run_id,
+                "workflow": workflow,
+                "project_dir": str(project_dir),
+                "experiment_dir": str(experiment_dir),
+                "run_dir": str(run_dir),
+                "artifacts_dir": str(artifacts_dir),
+                "status": "running",
+                "started_at": _now(),
+                "setup_command": spec.get("setup_command"),
+                "command": spec["command"],
+            }
+            _write_status(status_path, status_payload)
+
+            if not project_dir.exists():
+                status_payload.update(
+                    {
+                        "status": "failed",
+                        "step": "prepare",
+                        "finished_at": _now(),
+                        "error": f"Project directory does not exist: {project_dir}",
+                    }
+                )
+                _write_status(status_path, status_payload)
+                raise RuntimeError(status_payload["error"])
+
+            if not experiment_dir.exists():
+                status_payload.update(
+                    {
+                        "status": "failed",
+                        "step": "prepare",
+                        "finished_at": _now(),
+                        "error": f"Experiment directory does not exist: {experiment_dir}",
+                    }
+                )
+                _write_status(status_path, status_payload)
+                raise RuntimeError(status_payload["error"])
+
+            setup_command = spec.get("setup_command")
+            if setup_command:
+                setup_result = _run_shell(
+                    str(setup_command),
+                    cwd=project_dir,
+                    env=env,
+                    stdout_path=stdout_path,
+                    stderr_path=stderr_path,
+                )
+                if setup_result.returncode != 0:
+                    status_payload.update(
+                        {
+                            "status": "failed",
+                            "step": "setup",
+                            "finished_at": _now(),
+                            "exit_code": setup_result.returncode,
+                            "error": (
+                                "Setup command failed with exit code "
+                                f"{setup_result.returncode}"
+                            ),
+                        }
+                    )
+                    _write_status(status_path, status_payload)
+                    raise RuntimeError(status_payload["error"])
+
+            command_result = _run_shell(
+                str(spec["command"]),
+                cwd=experiment_dir,
+                env=env,
+                stdout_path=stdout_path,
+                stderr_path=stderr_path,
+            )
+            if command_result.returncode != 0:
+                status_payload.update(
+                    {
+                        "status": "failed",
+                        "step": "command",
+                        "finished_at": _now(),
+                        "exit_code": command_result.returncode,
+                        "error": (
+                            "Command failed with exit code "
+                            f"{command_result.returncode}"
+                        ),
+                    }
+                )
+                _write_status(status_path, status_payload)
+                raise RuntimeError(status_payload["error"])
+
+            status_payload.update(
+                {
+                    "status": "completed",
+                    "finished_at": _now(),
+                    "exit_code": 0,
+                }
+            )
+            _write_status(status_path, status_payload)
+            return {
+                "run_id": run_id,
+                "status": "completed",
+                "run_dir": str(run_dir),
+                "artifacts_dir": str(artifacts_dir),
+            }
+
+
+        if __name__ == "__main__":
+            runpod.serverless.start({"handler": handler})
         """
     )
 
@@ -781,6 +1179,40 @@ def runpod_endpoint_name(config: ProjectConfig) -> str:
     return config.runtime.runpod.endpoint_name or f"quadra-{config.name}"
 
 
+def remote_worker_path(config: ProjectConfig) -> str:
+    return str(PurePosixPath(config.runtime.project_dir) / QUADRA_WORKER_FILENAME)
+
+
+def expand_template_tokens(value: str, config: ProjectConfig) -> str:
+    return (
+        value.replace("{project_name}", config.name)
+        .replace("{project_dir}", config.runtime.project_dir)
+        .replace("{worker_path}", remote_worker_path(config))
+        .replace("{runpod_volume_root}", str(RUNPOD_VOLUME_ROOT))
+    )
+
+
+def build_template_spec(config: ProjectConfig) -> TemplateSpec:
+    template = config.runtime.runpod.template
+    return TemplateSpec(
+        name=expand_template_tokens(template.name, config),
+        image_name=expand_template_tokens(template.image_name, config),
+        ports=tuple(expand_template_tokens(item, config) for item in template.ports),
+        docker_entrypoint=tuple(
+            expand_template_tokens(item, config) for item in template.docker_entrypoint
+        ),
+        docker_start_cmd=tuple(
+            expand_template_tokens(item, config) for item in template.docker_start_cmd
+        ),
+        env={
+            key: expand_template_tokens(value, config)
+            for key, value in template.env.items()
+        },
+        container_disk_gb=template.container_disk_gb,
+        readme=expand_template_tokens(template.readme, config),
+    )
+
+
 def resolve_runpod_volume(config: ProjectConfig, client: Any) -> VolumeHandle:
     target_id = config.runtime.runpod.network_volume_id
     target_name = config.runtime.runpod.network_volume_name or config.name
@@ -816,6 +1248,55 @@ def resolve_runpod_volume(config: ProjectConfig, client: Any) -> VolumeHandle:
     raise QuadraError(
         f"No RunPod network volume named {target_name!r} was found. "
         "Create it in RunPod and retry, or configure runtime.runpod.network_volume_id."
+    )
+
+
+def resolve_template(config: ProjectConfig, client: Any) -> TemplateHandle:
+    template_id = config.runtime.runpod.template.id
+    template_name = build_template_spec(config).name
+
+    if template_id:
+        templates = list(client.get_templates())
+        for template in templates:
+            if optional_str(template.get("id")) == template_id:
+                return TemplateHandle(
+                    id=template_id,
+                    name=optional_str(template.get("name")) or template_id,
+                )
+        return TemplateHandle(id=template_id, name=template_name)
+
+    templates = list(client.get_templates())
+    matches = [
+        template
+        for template in templates
+        if optional_str(template.get("name")) == template_name
+    ]
+    if len(matches) == 1:
+        template = matches[0]
+        return TemplateHandle(
+            id=str(template["id"]),
+            name=optional_str(template.get("name")) or template_name,
+        )
+    if len(matches) > 1:
+        raise QuadraError(
+            f"Multiple RunPod templates are named {template_name!r}. "
+            "Set runtime.runpod.template.id."
+        )
+
+    spec = build_template_spec(config)
+    template = client.create_template(
+        name=spec.name,
+        image_name=spec.image_name,
+        ports=spec.ports,
+        docker_entrypoint=spec.docker_entrypoint,
+        docker_start_cmd=spec.docker_start_cmd,
+        env=spec.env,
+        container_disk_gb=spec.container_disk_gb,
+        readme=spec.readme,
+    )
+    return TemplateHandle(
+        id=str(template["id"]),
+        name=optional_str(template.get("name")) or spec.name,
     )
 
 
@@ -994,16 +1475,10 @@ def resolve_endpoint(
             "Set runtime.runpod.endpoint_id."
         )
 
-    template_id = config.runtime.runpod.template_id
-    if not template_id:
-        raise QuadraError(
-            "No RunPod endpoint was found for this project. Set runtime.runpod.endpoint_id "
-            "or configure runtime.runpod.template_id so Quadra can create one."
-        )
-
+    template = resolve_template(config, client)
     endpoint = client.create_endpoint(
         name=endpoint_name,
-        template_id=template_id,
+        template_id=template.id,
         gpu_ids=config.runtime.runpod.gpu_ids,
         network_volume_id=volume.id,
         locations=config.runtime.runpod.locations,
@@ -1015,6 +1490,7 @@ def resolve_endpoint(
         flashboot=config.runtime.runpod.flashboot,
         allowed_cuda_versions=config.runtime.runpod.allowed_cuda_versions,
         gpu_count=config.runtime.runpod.gpu_count,
+        timeout_seconds=config.runtime.runpod.timeout_seconds,
     )
     return EndpointHandle(
         id=str(endpoint["id"]),
@@ -1075,6 +1551,48 @@ def save_last_run(config: ProjectConfig, reference: RunReference) -> None:
     config.last_run_file.write_text(
         json.dumps(reference.__dict__, indent=2, sort_keys=True) + "\n",
         encoding="utf-8",
+    )
+
+
+def format_duration(seconds: int) -> str:
+    if seconds < 60:
+        return f"{seconds}s"
+    minutes, remaining_seconds = divmod(seconds, 60)
+    if minutes < 60:
+        return f"{minutes}m{remaining_seconds:02d}s"
+    hours, remaining_minutes = divmod(minutes, 60)
+    return f"{hours}h{remaining_minutes:02d}m{remaining_seconds:02d}s"
+
+
+def describe_job_status(status: str, *, has_remote_output: bool) -> str:
+    if status == "IN_QUEUE":
+        return "queued on RunPod"
+    if status in {"IN_PROGRESS", "RUNNING"}:
+        if has_remote_output:
+            return "worker running"
+        return "worker running, waiting for remote logs"
+    if status == "COMPLETED":
+        return "completed"
+    if status == "FAILED":
+        return "failed"
+    if status == "TIMED_OUT":
+        return "timed out"
+    if status == "CANCELLED":
+        return "cancelled"
+    return status.replace("_", " ").lower()
+
+
+def report_poll_status(
+    reference: RunReference,
+    status: str,
+    *,
+    has_remote_output: bool,
+    elapsed_seconds: int,
+) -> None:
+    description = describe_job_status(status, has_remote_output=has_remote_output)
+    click.echo(
+        f"[quadra] {reference.workflow}: {description} "
+        f"(status {status}, elapsed {format_duration(elapsed_seconds)})"
     )
 
 
@@ -1151,8 +1669,13 @@ def stream_logs(config: ProjectConfig, reference: RunReference, *, follow: bool)
     stderr_key = remote_run_file_key(config, reference.run_id, "stderr.log")
     last_stdout = ""
     last_stderr = ""
+    has_remote_output = False
+    last_reported_status: str | None = None
+    last_progress_at = 0.0
+    submitted_at = parse_utc_timestamp(reference.submitted_at)
 
     while True:
+        saw_output_this_iteration = False
         stdout_text = read_text_object(s3, volume.id, stdout_key)
         stderr_text = read_text_object(s3, volume.id, stderr_key)
 
@@ -1162,6 +1685,8 @@ def stream_logs(config: ProjectConfig, reference: RunReference, *, follow: bool)
             chunk = stdout_text
         if chunk:
             click.echo(chunk, nl=False)
+            has_remote_output = True
+            saw_output_this_iteration = True
         last_stdout = stdout_text
 
         if stderr_text.startswith(last_stderr):
@@ -1170,10 +1695,46 @@ def stream_logs(config: ProjectConfig, reference: RunReference, *, follow: bool)
             chunk = stderr_text
         if chunk:
             click.echo(chunk, err=True, nl=False)
+            has_remote_output = True
+            saw_output_this_iteration = True
         last_stderr = stderr_text
 
         job = client.get_job(reference.endpoint_id, reference.job_id)
         status = str(job["status"])
+        elapsed_seconds = 0
+        if submitted_at is not None:
+            elapsed_seconds = max(
+                0,
+                int((datetime.now(timezone.utc) - submitted_at).total_seconds()),
+            )
+
+        now_monotonic = time.monotonic()
+        should_report = False
+        if status != last_reported_status:
+            should_report = True
+        elif (
+            follow
+            and now_monotonic - last_progress_at >= POLL_PROGRESS_INTERVAL_SECONDS
+            and not saw_output_this_iteration
+        ):
+            should_report = True
+        elif (
+            not follow
+            and not saw_output_this_iteration
+            and last_reported_status is None
+        ):
+            should_report = True
+
+        if should_report:
+            report_poll_status(
+                reference,
+                status,
+                has_remote_output=has_remote_output,
+                elapsed_seconds=elapsed_seconds,
+            )
+            last_reported_status = status
+            last_progress_at = now_monotonic
+
         if not follow or status in FINAL_JOB_STATES:
             return status
         time.sleep(1)
@@ -1197,9 +1758,20 @@ def pull_run(
 
 
 def run_named_workflow(config: ProjectConfig, workflow: str) -> int:
-    sync_project(config)
-    reference, _endpoint = submit_workflow(config, (workflow,))
+    click.echo(f"syncing {config.name} -> {config.runtime.project_dir}")
+    volume, uploaded, deleted = sync_project(config)
+    click.echo(
+        f"volume: {volume.id} ({volume.data_center_id or 'unknown-dc'}), "
+        f"uploaded: {uploaded}, deleted: {deleted}"
+    )
+    click.echo(f"submitting {workflow}")
+    reference, endpoint = submit_workflow(config, (workflow,))
+    click.echo(f"run_id: {reference.run_id}")
+    click.echo(f"job_id: {reference.job_id}")
+    click.echo(f"endpoint_id: {endpoint.id}")
+    click.echo("polling RunPod job status and remote logs...")
     status = stream_logs(config, reference, follow=True)
+    click.echo(f"pulling artifacts for {reference.run_id}")
     pull_run(config, run_id=reference.run_id)
     return 0 if status == "COMPLETED" else 1
 
