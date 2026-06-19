@@ -5,12 +5,23 @@ import json
 import posixpath
 import unittest
 from contextlib import chdir
+from http import HTTPStatus
 from pathlib import Path, PurePosixPath
 from unittest.mock import patch
 
 from click.testing import CliRunner
 
-from quadra.cli import cli, load_banner_text
+from quadra._generated.runpod_rest_client.models.endpoint import Endpoint
+from quadra._generated.runpod_rest_client.models.template import Template
+from quadra._generated.runpod_rest_client.types import Response
+from quadra.cli import (
+    RunpodClient,
+    cli,
+    load_banner_text,
+    load_project,
+    resolve_runpod_volume,
+)
+from quadra.runpod_rest import build_endpoint_create_body
 
 
 class FakeS3Client:
@@ -74,8 +85,8 @@ class FakeRunpodClient:
         self.jobs: dict[str, dict[str, object]] = {}
         self.submissions: list[dict[str, object]] = []
 
-    def get_user(self) -> dict[str, object]:
-        return {"networkVolumes": [self.volume]}
+    def get_network_volumes(self) -> list[dict[str, object]]:
+        return [self.volume]
 
     def get_endpoints(self) -> list[dict[str, object]]:
         return list(self.endpoints)
@@ -190,6 +201,243 @@ class PollingFakeRunpodClient(FakeRunpodClient):
 class QuadraCLITestCase(unittest.TestCase):
     def setUp(self) -> None:
         self.runner = CliRunner()
+
+    def test_build_endpoint_create_body_maps_quadra_fields_to_rest(self) -> None:
+        body = build_endpoint_create_body(
+            name="quadra-bonsai",
+            template_id="tpl-123",
+            gpu_ids="AMPERE_16",
+            network_volume_id="nv-123",
+            locations="US-IL-1",
+            idle_timeout=5,
+            scaler_type="QUEUE_DELAY",
+            scaler_value=4,
+            workers_min=0,
+            workers_max=3,
+            flashboot=False,
+            allowed_cuda_versions=("12.4", "12.5"),
+            gpu_count=1,
+            timeout_seconds=600,
+        )
+
+        self.assertEqual(
+            body.to_dict(),
+            {
+                "name": "quadra-bonsai",
+                "templateId": "tpl-123",
+                "gpuTypeIds": [
+                    "NVIDIA RTX A4000",
+                    "NVIDIA  RTX A4500",
+                    "NVIDIA RTX 4000 Ada Generation",
+                    "NVIDIA RTX 2000 Ada Generation",
+                ],
+                "networkVolumeId": "nv-123",
+                "dataCenterIds": ["US-IL-1"],
+                "idleTimeout": 5,
+                "scalerType": "QUEUE_DELAY",
+                "scalerValue": 4,
+                "workersMin": 0,
+                "workersMax": 3,
+                "flashboot": False,
+                "allowedCudaVersions": ["12.4", "12.5"],
+                "gpuCount": 1,
+                "executionTimeoutMs": 600000,
+            },
+        )
+
+    def test_runpod_client_create_endpoint_uses_rest_create_timeout(self) -> None:
+        class FakeRunpodModule:
+            def __init__(self) -> None:
+                self.api_key: str | None = None
+
+        fake_runpod = FakeRunpodModule()
+        client = RunpodClient(fake_runpod, "rp-key")
+        captured: dict[str, object] = {}
+
+        with patch.object(
+            client.rest_client,
+            "_request",
+        ) as request:
+            def fake_request(fn: object, *, invalid_response_message: str, **kwargs: object) -> object:
+                del fn, invalid_response_message
+                body = kwargs["body"]
+                captured["payload"] = body.to_dict()
+                return Endpoint.from_dict(
+                    {
+                        "id": "ep-rest",
+                        "name": "quadra-bonsai",
+                        "executionTimeoutMs": 600000,
+                    }
+                )
+
+            request.side_effect = fake_request
+            endpoint = client.create_endpoint(
+                name="quadra-bonsai",
+                template_id="tpl-123",
+                gpu_ids="AMPERE_16",
+                network_volume_id="nv-123",
+                locations="US-IL-1",
+                idle_timeout=5,
+                scaler_type="QUEUE_DELAY",
+                scaler_value=4,
+                workers_min=0,
+                workers_max=3,
+                flashboot=False,
+                allowed_cuda_versions=("12.4", "12.5"),
+                gpu_count=1,
+                timeout_seconds=600,
+            )
+
+        self.assertEqual(fake_runpod.api_key, "rp-key")
+        self.assertEqual(
+            captured["payload"],
+            {
+                "name": "quadra-bonsai",
+                "templateId": "tpl-123",
+                "gpuTypeIds": [
+                    "NVIDIA RTX A4000",
+                    "NVIDIA  RTX A4500",
+                    "NVIDIA RTX 4000 Ada Generation",
+                    "NVIDIA RTX 2000 Ada Generation",
+                ],
+                "networkVolumeId": "nv-123",
+                "dataCenterIds": ["US-IL-1"],
+                "idleTimeout": 5,
+                "scalerType": "QUEUE_DELAY",
+                "scalerValue": 4,
+                "workersMin": 0,
+                "workersMax": 3,
+                "flashboot": False,
+                "allowedCudaVersions": ["12.4", "12.5"],
+                "gpuCount": 1,
+                "executionTimeoutMs": 600000,
+            },
+        )
+        self.assertEqual(endpoint["id"], "ep-rest")
+        self.assertEqual(endpoint["executionTimeoutMs"], 600000)
+
+    def test_runpod_client_update_endpoint_uses_rest_shape(self) -> None:
+        class FakeRunpodModule:
+            def __init__(self) -> None:
+                self.api_key: str | None = None
+
+        fake_runpod = FakeRunpodModule()
+        client = RunpodClient(fake_runpod, "rp-key")
+        captured: dict[str, object] = {}
+
+        with patch.object(client.rest_client, "_request") as request:
+            def fake_request(fn: object, *, invalid_response_message: str, **kwargs: object) -> object:
+                del fn, invalid_response_message
+                body = kwargs["body"]
+                captured["payload"] = body.to_dict()
+                return Endpoint.from_dict(
+                    {
+                        "id": "ep-rest",
+                        "name": "quadra-bonsai",
+                        "executionTimeoutMs": 90000,
+                    }
+                )
+
+            request.side_effect = fake_request
+            endpoint = client.update_endpoint(
+                "ep-rest",
+                gpu_ids="ADA_24",
+                locations="US-IL-1,US-NC-1",
+                timeout_seconds=90,
+            )
+
+        self.assertEqual(fake_runpod.api_key, "rp-key")
+        self.assertEqual(
+            captured["payload"],
+            {
+                "gpuTypeIds": ["NVIDIA GeForce RTX 4090"],
+                "dataCenterIds": ["US-IL-1", "US-NC-1"],
+                "executionTimeoutMs": 90000,
+            },
+        )
+        self.assertEqual(endpoint["executionTimeoutMs"], 90000)
+
+    def test_runpod_client_uses_rest_template_list(self) -> None:
+        class FakeRunpodModule:
+            def __init__(self) -> None:
+                self.api_key: str | None = None
+
+        fake_runpod = FakeRunpodModule()
+        client = RunpodClient(fake_runpod, "rp-key")
+
+        response = Response(
+            status_code=HTTPStatus.OK,
+            content=b"[]",
+            headers={},
+            parsed=[Template.from_dict({"id": "tpl-rest", "name": "quadra-template"})],
+        )
+        with patch("quadra.runpod_rest.list_templates_api.sync_detailed", return_value=response):
+            templates = client.get_templates()
+
+        self.assertEqual(fake_runpod.api_key, "rp-key")
+        self.assertEqual(templates, [{"id": "tpl-rest", "name": "quadra-template"}])
+
+    def test_runpod_client_uses_rest_template_create(self) -> None:
+        class FakeRunpodModule:
+            def __init__(self) -> None:
+                self.api_key: str | None = None
+
+        fake_runpod = FakeRunpodModule()
+        client = RunpodClient(fake_runpod, "rp-key")
+        captured: dict[str, object] = {}
+
+        with patch.object(client.rest_client, "_request") as request:
+            def fake_request(fn: object, *, invalid_response_message: str, **kwargs: object) -> object:
+                del fn, invalid_response_message
+                body = kwargs["body"]
+                captured["payload"] = body.to_dict()
+                return Template.from_dict({"id": "tpl-rest", "name": "quadra-worker"})
+
+            request.side_effect = fake_request
+            template = client.create_template(
+                name="quadra-worker",
+                image_name="runpod/base:0.6.1-cuda12.4.1",
+                ports=("8080/http",),
+                docker_entrypoint=("python",),
+                docker_start_cmd=("python", "-u", "/runpod-volume/projects/bonsai/quadra_worker.py"),
+                env={"FOO": "bar"},
+                container_disk_gb=20,
+                readme="Managed by Quadra.",
+            )
+
+        self.assertEqual(fake_runpod.api_key, "rp-key")
+        self.assertEqual(
+            captured["payload"],
+            {
+                "name": "quadra-worker",
+                "imageName": "runpod/base:0.6.1-cuda12.4.1",
+                "isServerless": True,
+                "containerDiskInGb": 20,
+                "ports": ["8080/http"],
+                "dockerEntrypoint": ["python"],
+                "dockerStartCmd": [
+                    "python",
+                    "-u",
+                    "/runpod-volume/projects/bonsai/quadra_worker.py",
+                ],
+                "env": {"FOO": "bar"},
+                "readme": "Managed by Quadra.",
+            },
+        )
+        self.assertEqual(template["id"], "tpl-rest")
+
+    def test_resolve_runpod_volume_uses_rest_network_volume_list(self) -> None:
+        with self.runner.isolated_filesystem():
+            result = self.runner.invoke(cli, ["init", "bonsai"])
+            self.assertEqual(result.exit_code, 0, result.output)
+
+            with chdir("bonsai"):
+                config = load_project()
+                volume = resolve_runpod_volume(config, FakeRunpodClient(FakeS3Client()))
+
+        self.assertEqual(volume.id, "nv-123")
+        self.assertEqual(volume.name, "bonsai")
+        self.assertEqual(volume.data_center_id, "US-IL-1")
 
     def test_no_args_prints_plain_banner_before_help(self) -> None:
         result = self.runner.invoke(cli, [])

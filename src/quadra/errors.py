@@ -1,0 +1,2 @@
+class QuadraError(RuntimeError):
+    pass

@@ -18,6 +18,8 @@ from typing import Any
 import click
 
 from quadra import __version__
+from quadra.errors import QuadraError
+from quadra.runpod_rest import RunpodRestClient
 
 CONFIG_FILENAME = "quadra.toml"
 STATE_DIRNAME = ".quadra"
@@ -25,9 +27,6 @@ LAST_RUN_FILENAME = "last-run.json"
 CONFIG_SCHEMA_VERSION = 3
 RUNPOD_VOLUME_ROOT = PurePosixPath("/runpod-volume")
 DEFAULT_PROJECT_DIR = "/runpod-volume/projects/{project_name}"
-DEFAULT_RUNPOD_API_BASE_URL = "https://api.runpod.io"
-DEFAULT_RUNPOD_REST_API_BASE_URL = "https://rest.runpod.io/v1"
-DEFAULT_RUNPOD_ENDPOINT_BASE_URL = "https://api.runpod.ai/v2"
 FINAL_JOB_STATES = {"COMPLETED", "FAILED", "TIMED_OUT", "CANCELLED"}
 POLL_PROGRESS_INTERVAL_SECONDS = 10
 QUADRA_WORKER_FILENAME = "quadra_worker.py"
@@ -244,131 +243,21 @@ class BannerGroup(click.Group):
         return super().parse_args(ctx, args)
 
 
-class QuadraError(RuntimeError):
-    pass
-
-
-class RunpodHttpClient:
-    def __init__(self, api_key: str):
+class RunpodClient:
+    def __init__(self, runpod_module: Any, api_key: str):
+        self.runpod = runpod_module
+        self.runpod.api_key = api_key
         self.api_key = api_key
-        self.api_base_url = os.getenv(
-            "RUNPOD_API_BASE_URL", DEFAULT_RUNPOD_API_BASE_URL
-        )
-        self.rest_api_base_url = os.getenv(
-            "RUNPOD_REST_API_BASE_URL", DEFAULT_RUNPOD_REST_API_BASE_URL
-        )
-        self.endpoint_url_base = os.getenv(
-            "RUNPOD_ENDPOINT_BASE_URL", DEFAULT_RUNPOD_ENDPOINT_BASE_URL
-        )
+        self.rest_client = RunpodRestClient(api_key)
 
-    def _request(
-        self,
-        method: str,
-        url: str,
-        *,
-        payload: dict[str, Any] | None = None,
-        timeout: int = 30,
-    ) -> dict[str, Any]:
-        try:
-            import requests
-        except ImportError as exc:
-            raise QuadraError(
-                "This Quadra installation is missing the `requests` package."
-            ) from exc
-
-        headers = {
-            "Content-Type": "application/json",
-            "Authorization": f"Bearer {self.api_key}",
-            "User-Agent": f"Quadra/{__version__}",
-        }
-        try:
-            response = requests.request(
-                method,
-                url,
-                headers=headers,
-                json=payload,
-                timeout=timeout,
-            )
-        except requests.RequestException as exc:
-            raise QuadraError(f"RunPod request failed: {exc}") from exc
-
-        if response.status_code == 401:
-            raise QuadraError("Unauthorized request, please check your RunPod API key.")
-
-        try:
-            data = response.json()
-        except ValueError as exc:
-            raise QuadraError("RunPod returned an invalid JSON response.") from exc
-
-        if response.status_code >= 400:
-            raise QuadraError(
-                f"RunPod returned HTTP {response.status_code}: {response.text.strip()}"
-            )
-
-        return data
-
-    def run_graphql_query(self, query: str) -> dict[str, Any]:
-        payload = self._request(
-            "POST",
-            f"{self.api_base_url}/graphql",
-            payload={"query": query},
-        )
-        if payload.get("errors"):
-            error = payload["errors"][0]
-            if isinstance(error, dict) and error.get("message"):
-                raise QuadraError(str(error["message"]))
-            raise QuadraError(str(error))
-        return payload
-
-    def get_user(self) -> dict[str, Any]:
-        return self.run_graphql_query(runpod_query_user())["data"]["myself"]
+    def get_network_volumes(self) -> list[dict[str, Any]]:
+        return self.rest_client.get_network_volumes()
 
     def get_endpoints(self) -> list[dict[str, Any]]:
-        return self.run_graphql_query(runpod_query_endpoints())["data"]["myself"][
-            "endpoints"
-        ]
-
-    def create_endpoint(
-        self,
-        *,
-        name: str,
-        template_id: str,
-        gpu_ids: str,
-        network_volume_id: str,
-        locations: str | None,
-        idle_timeout: int,
-        scaler_type: str,
-        scaler_value: int,
-        workers_min: int,
-        workers_max: int,
-        flashboot: bool,
-        allowed_cuda_versions: tuple[str, ...],
-        gpu_count: int,
-        timeout_seconds: int,
-    ) -> dict[str, Any]:
-        query = runpod_create_endpoint_mutation(
-            name=name,
-            template_id=template_id,
-            gpu_ids=gpu_ids,
-            network_volume_id=network_volume_id,
-            locations=locations,
-            idle_timeout=idle_timeout,
-            scaler_type=scaler_type,
-            scaler_value=scaler_value,
-            workers_min=workers_min,
-            workers_max=workers_max,
-            flashboot=flashboot,
-            allowed_cuda_versions=allowed_cuda_versions,
-            gpu_count=gpu_count,
-            execution_timeout_ms=max(timeout_seconds, 0) * 1000,
-        )
-        return self.run_graphql_query(query)["data"]["saveEndpoint"]
+        return self.rest_client.get_endpoints()
 
     def get_templates(self) -> list[dict[str, Any]]:
-        payload = self._request("GET", f"{self.rest_api_base_url}/templates")
-        if not isinstance(payload, list):
-            raise QuadraError("RunPod returned an invalid template list response.")
-        return [item for item in payload if isinstance(item, dict)]
+        return self.rest_client.get_templates()
 
     def create_template(
         self,
@@ -382,60 +271,16 @@ class RunpodHttpClient:
         container_disk_gb: int,
         readme: str,
     ) -> dict[str, Any]:
-        payload: dict[str, Any] = {
-            "name": name,
-            "imageName": image_name,
-            "isServerless": True,
-            "containerDiskInGb": container_disk_gb,
-        }
-        if ports:
-            payload["ports"] = list(ports)
-        if docker_entrypoint:
-            payload["dockerEntrypoint"] = list(docker_entrypoint)
-        if docker_start_cmd:
-            payload["dockerStartCmd"] = list(docker_start_cmd)
-        if env:
-            payload["env"] = env
-        if readme:
-            payload["readme"] = readme
-
-        response = self._request(
-            "POST", f"{self.rest_api_base_url}/templates", payload=payload
+        return self.rest_client.create_template(
+            name=name,
+            image_name=image_name,
+            ports=ports,
+            docker_entrypoint=docker_entrypoint,
+            docker_start_cmd=docker_start_cmd,
+            env=env,
+            container_disk_gb=container_disk_gb,
+            readme=readme,
         )
-        if not isinstance(response, dict):
-            raise QuadraError("RunPod returned an invalid template create response.")
-        return response
-
-    def run_job(self, endpoint_id: str, request_input: dict[str, Any]) -> dict[str, Any]:
-        if "input" not in request_input:
-            request_input = {"input": request_input}
-        return self._request(
-            "POST",
-            f"{self.endpoint_url_base}/{endpoint_id}/run",
-            payload=request_input,
-        )
-
-    def get_job(
-        self, endpoint_id: str, job_id: str, *, source: str = "status"
-    ) -> dict[str, Any]:
-        return self._request(
-            "GET",
-            f"{self.endpoint_url_base}/{endpoint_id}/{source}/{job_id}",
-        )
-
-
-class RunpodSdkClient:
-    def __init__(self, runpod_module: Any, api_key: str):
-        self.runpod = runpod_module
-        self.runpod.api_key = api_key
-        self.api_key = api_key
-        self.http_client = RunpodHttpClient(api_key)
-
-    def get_user(self) -> dict[str, Any]:
-        return self.http_client.get_user()
-
-    def get_endpoints(self) -> list[dict[str, Any]]:
-        return self.http_client.get_endpoints()
 
     def create_endpoint(
         self,
@@ -455,7 +300,7 @@ class RunpodSdkClient:
         gpu_count: int,
         timeout_seconds: int,
     ) -> dict[str, Any]:
-        return self.http_client.create_endpoint(
+        return self.rest_client.create_endpoint(
             name=name,
             template_id=template_id,
             gpu_ids=gpu_ids,
@@ -472,33 +317,17 @@ class RunpodSdkClient:
             timeout_seconds=timeout_seconds,
         )
 
-    def get_templates(self) -> list[dict[str, Any]]:
-        return self.http_client.get_templates()
-
-    def create_template(
+    def update_endpoint(
         self,
-        *,
-        name: str,
-        image_name: str,
-        ports: tuple[str, ...],
-        docker_entrypoint: tuple[str, ...],
-        docker_start_cmd: tuple[str, ...],
-        env: dict[str, str],
-        container_disk_gb: int,
-        readme: str,
+        endpoint_id: str,
+        payload: dict[str, Any] | None = None,
+        **kwargs: Any,
     ) -> dict[str, Any]:
-        return self.http_client.create_template(
-            name=name,
-            image_name=image_name,
-            ports=ports,
-            docker_entrypoint=docker_entrypoint,
-            docker_start_cmd=docker_start_cmd,
-            env=env,
-            container_disk_gb=container_disk_gb,
-            readme=readme,
-        )
+        return self.rest_client.update_endpoint(endpoint_id, payload, **kwargs)
 
-    def run_job(self, endpoint_id: str, request_input: dict[str, Any]) -> dict[str, Any]:
+    def run_job(
+        self, endpoint_id: str, request_input: dict[str, Any]
+    ) -> dict[str, Any]:
         endpoint = self.runpod.Endpoint(endpoint_id, api_key=self.api_key)
         job = endpoint.run(request_input)
         return {"id": job.job_id}
@@ -510,10 +339,6 @@ class RunpodSdkClient:
 
         endpoint = self.runpod.Endpoint(endpoint_id, api_key=self.api_key)
         return Job(endpoint_id, job_id, endpoint.rp_client)._fetch_job(source=source)
-
-
-def graphql_string(value: object) -> str:
-    return json.dumps(str(value))
 
 
 def now_utc() -> str:
@@ -578,120 +403,6 @@ def normalize_allowed_cuda_versions(value: object | None) -> tuple[str, ...]:
     )
 
 
-def runpod_query_user() -> str:
-    return """
-    query myself {
-      myself {
-        id
-        pubKey
-        networkVolumes {
-          id
-          name
-          size
-          dataCenterId
-        }
-      }
-    }
-    """
-
-
-def runpod_query_endpoints() -> str:
-    return """
-    query Query {
-      myself {
-        endpoints {
-          id
-          name
-          templateId
-          gpuIds
-          gpuCount
-          networkVolumeId
-          locations
-          idleTimeout
-          scalerType
-          scalerValue
-          workersMin
-          workersMax
-          flashBootType
-          networkVolume {
-            id
-            dataCenterId
-          }
-        }
-      }
-    }
-    """
-
-
-def runpod_create_endpoint_mutation(
-    *,
-    name: str,
-    template_id: str,
-    gpu_ids: str,
-    network_volume_id: str,
-    locations: str | None,
-    idle_timeout: int,
-    scaler_type: str,
-    scaler_value: int,
-    workers_min: int,
-    workers_max: int,
-    flashboot: bool,
-    allowed_cuda_versions: tuple[str, ...],
-    gpu_count: int,
-    execution_timeout_ms: int,
-) -> str:
-    fields = []
-    if flashboot:
-        fields.append("flashBootType: FLASHBOOT")
-    fields.extend(
-        [
-            f"name: {graphql_string(name)}",
-            f"templateId: {graphql_string(template_id)}",
-            f"gpuIds: {graphql_string(gpu_ids)}",
-            f"networkVolumeId: {graphql_string(network_volume_id)}",
-            f"idleTimeout: {idle_timeout}",
-            f"scalerType: {graphql_string(scaler_type)}",
-            f"scalerValue: {scaler_value}",
-            f"workersMin: {workers_min}",
-            f"workersMax: {workers_max}",
-            f"gpuCount: {gpu_count}",
-        ]
-    )
-    if locations:
-        fields.append(f"locations: {graphql_string(locations)}")
-    if allowed_cuda_versions:
-        fields.append(
-            f"allowedCudaVersions: {graphql_string(','.join(allowed_cuda_versions))}"
-        )
-    if execution_timeout_ms:
-        fields.append(f"executionTimeoutMs: {execution_timeout_ms}")
-
-    return f"""
-    mutation {{
-      saveEndpoint(
-        input: {{
-          {", ".join(fields)}
-        }}
-      ) {{
-        id
-        name
-        templateId
-        gpuIds
-        gpuCount
-        networkVolumeId
-        locations
-        idleTimeout
-        scalerType
-        scalerValue
-        workersMin
-        workersMax
-        flashBootType
-        executionTimeoutMs
-      }}
-    }}
-    """
-
-
 def find_project_root(start: Path | None = None) -> Path:
     current = (start or Path.cwd()).resolve()
     for candidate in (current, *current.parents):
@@ -732,8 +443,7 @@ def load_project(start: Path | None = None) -> ProjectConfig:
     template_config = RunpodTemplateConfig(
         id=optional_str(template_data.get("id"))
         or optional_str(runpod_data.get("template_id")),
-        name=optional_str(template_data.get("name"))
-        or f"quadra-{project_name}-worker",
+        name=optional_str(template_data.get("name")) or f"quadra-{project_name}-worker",
         image_name=str(template_data.get("image_name", DEFAULT_TEMPLATE_IMAGE)).strip(),
         ports=normalize_str_sequence(
             template_data.get("ports"), "runtime.runpod.template.ports"
@@ -743,8 +453,7 @@ def load_project(start: Path | None = None) -> ProjectConfig:
             "runtime.runpod.template.docker_entrypoint",
         ),
         docker_start_cmd=normalize_str_sequence(
-            template_data.get("docker_start_cmd")
-            or ["python", "-u", "{worker_path}"],
+            template_data.get("docker_start_cmd") or ["python", "-u", "{worker_path}"],
             "runtime.runpod.template.docker_start_cmd",
         ),
         env=normalize_string_map(
@@ -1169,10 +878,12 @@ def load_runpod_client(config: ProjectConfig) -> Any:
 
     try:
         import runpod
-    except ImportError:
-        return RunpodHttpClient(api_key)
+    except ImportError as exc:
+        raise QuadraError(
+            "This Quadra installation is missing the `runpod` package."
+        ) from exc
 
-    return RunpodSdkClient(runpod, api_key)
+    return RunpodClient(runpod, api_key)
 
 
 def runpod_endpoint_name(config: ProjectConfig) -> str:
@@ -1216,7 +927,7 @@ def build_template_spec(config: ProjectConfig) -> TemplateSpec:
 def resolve_runpod_volume(config: ProjectConfig, client: Any) -> VolumeHandle:
     target_id = config.runtime.runpod.network_volume_id
     target_name = config.runtime.runpod.network_volume_name or config.name
-    volumes = list(client.get_user().get("networkVolumes", []))
+    volumes = list(client.get_network_volumes())
 
     if target_id:
         for volume in volumes:
@@ -1229,9 +940,7 @@ def resolve_runpod_volume(config: ProjectConfig, client: Any) -> VolumeHandle:
         raise QuadraError(f"RunPod network volume {target_id} was not found.")
 
     matches = [
-        volume
-        for volume in volumes
-        if optional_str(volume.get("name")) == target_name
+        volume for volume in volumes if optional_str(volume.get("name")) == target_name
     ]
     if len(matches) == 1:
         volume = matches[0]
@@ -1376,7 +1085,9 @@ def build_s3_client(config: ProjectConfig, volume: VolumeHandle) -> Any:
                 "RunPod S3 credentials were rejected. Use your RunPod user ID as the access key "
                 "and a RunPod S3 API key secret as the secret key."
             ) from exc
-        raise QuadraError(f"Failed to access RunPod S3 volume {volume.id}: {exc}") from exc
+        raise QuadraError(
+            f"Failed to access RunPod S3 volume {volume.id}: {exc}"
+        ) from exc
 
     return s3
 
@@ -1441,7 +1152,9 @@ def ensure_project_synced(config: ProjectConfig, volume: VolumeHandle) -> None:
     try:
         s3.head_object(Bucket=volume.id, Key=key)
     except Exception as exc:
-        raise QuadraError("Remote project has not been synced yet. Run `quadra sync` first.") from exc
+        raise QuadraError(
+            "Remote project has not been synced yet. Run `quadra sync` first."
+        ) from exc
 
 
 def resolve_endpoint(
@@ -1452,10 +1165,17 @@ def resolve_endpoint(
     endpoint_name = runpod_endpoint_name(config)
 
     if endpoint_id:
-        matches = [endpoint for endpoint in endpoints if optional_str(endpoint.get("id")) == endpoint_id]
+        matches = [
+            endpoint
+            for endpoint in endpoints
+            if optional_str(endpoint.get("id")) == endpoint_id
+        ]
         if len(matches) == 1:
             endpoint = matches[0]
-            return EndpointHandle(id=str(endpoint["id"]), name=optional_str(endpoint.get("name")) or endpoint_id)
+            return EndpointHandle(
+                id=str(endpoint["id"]),
+                name=optional_str(endpoint.get("name")) or endpoint_id,
+            )
         raise QuadraError(f"RunPod endpoint {endpoint_id} was not found.")
 
     matches = [
@@ -1598,7 +1318,9 @@ def report_poll_status(
 
 def load_last_run(config: ProjectConfig) -> RunReference:
     if not config.last_run_file.exists():
-        raise QuadraError("No recent run is recorded locally. Run `quadra submit` first.")
+        raise QuadraError(
+            "No recent run is recorded locally. Run `quadra submit` first."
+        )
     try:
         data = json.loads(config.last_run_file.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
@@ -1621,7 +1343,9 @@ def submit_workflow(
     endpoint = resolve_endpoint(config, client, volume)
     command, workflow = resolve_run_command(config, command_parts, config.root)
     run_id = generate_run_id()
-    payload = build_job_payload(config, run_id=run_id, command=command, workflow=workflow)
+    payload = build_job_payload(
+        config, run_id=run_id, command=command, workflow=workflow
+    )
     job = client.run_job(endpoint.id, payload)
     reference = RunReference(
         run_id=run_id,
@@ -1643,9 +1367,7 @@ def read_text_object(s3: Any, bucket: str, key: str) -> str:
     return body.decode("utf-8", errors="replace")
 
 
-def download_prefix(
-    s3: Any, bucket: str, prefix: str, destination_root: Path
-) -> int:
+def download_prefix(s3: Any, bucket: str, prefix: str, destination_root: Path) -> int:
     keys = sorted(list_remote_keys(s3, bucket, prefix))
     if not keys:
         raise QuadraError(f"No files were found under remote prefix {prefix}.")
@@ -1842,7 +1564,9 @@ def submit(command_parts: tuple[str, ...]) -> None:
 
 
 @cli.command()
-@click.option("--follow/--no-follow", default=True, help="Poll until the job completes.")
+@click.option(
+    "--follow/--no-follow", default=True, help="Poll until the job completes."
+)
 def logs(follow: bool) -> None:
     """Stream logs for the most recently submitted run."""
     try:
@@ -1866,7 +1590,9 @@ def pull(run_id: str | None, destination: str | None) -> None:
         config = load_project()
         resolved_run_id = run_id or load_last_run(config).run_id
         destination_root = Path(destination).resolve() if destination else None
-        pulled_to = pull_run(config, run_id=resolved_run_id, destination_root=destination_root)
+        pulled_to = pull_run(
+            config, run_id=resolved_run_id, destination_root=destination_root
+        )
     except QuadraError as exc:
         raise click.ClickException(str(exc)) from exc
 

@@ -1,0 +1,211 @@
+from http import HTTPStatus
+from typing import Any, cast
+from urllib.parse import quote
+
+import httpx
+
+from ... import errors
+from ...client import AuthenticatedClient, Client
+from ...models.endpoint import Endpoint
+from ...types import UNSET, Response, Unset
+
+
+def _get_kwargs(
+    endpoint_id: str,
+    *,
+    include_template: bool | Unset = False,
+    include_workers: bool | Unset = False,
+) -> dict[str, Any]:
+
+    params: dict[str, Any] = {}
+
+    params["includeTemplate"] = include_template
+
+    params["includeWorkers"] = include_workers
+
+    params = {k: v for k, v in params.items() if v is not UNSET and v is not None}
+
+    _kwargs: dict[str, Any] = {
+        "method": "get",
+        "url": "/endpoints/{endpoint_id}".format(
+            endpoint_id=quote(str(endpoint_id), safe=""),
+        ),
+        "params": params,
+    }
+
+    return _kwargs
+
+
+def _parse_response(*, client: AuthenticatedClient | Client, response: httpx.Response) -> Any | Endpoint | None:
+    if response.status_code == 200:
+        response_200 = Endpoint.from_dict(response.json())
+
+        return response_200
+
+    if response.status_code == 400:
+        response_400 = cast(Any, None)
+        return response_400
+
+    if response.status_code == 404:
+        response_404 = cast(Any, None)
+        return response_404
+
+    if client.raise_on_unexpected_status:
+        raise errors.UnexpectedStatus(response.status_code, response.content)
+    else:
+        return None
+
+
+def _build_response(*, client: AuthenticatedClient | Client, response: httpx.Response) -> Response[Any | Endpoint]:
+    return Response(
+        status_code=HTTPStatus(response.status_code),
+        content=response.content,
+        headers=response.headers,
+        parsed=_parse_response(client=client, response=response),
+    )
+
+
+def sync_detailed(
+    endpoint_id: str,
+    *,
+    client: AuthenticatedClient | Client,
+    include_template: bool | Unset = False,
+    include_workers: bool | Unset = False,
+) -> Response[Any | Endpoint]:
+    """Find an endpoint by ID
+
+     Returns a single endpoint.
+
+    Args:
+        endpoint_id (str):
+        include_template (bool | Unset): Include information about the template used to create the
+            endpoint. Default: False. Example: True.
+        include_workers (bool | Unset): Include information about the workers running on the
+            endpoint. Default: False. Example: True.
+
+    Raises:
+        errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.
+        httpx.TimeoutException: If the request takes longer than Client.timeout.
+
+    Returns:
+        Response[Any | Endpoint]
+    """
+
+    kwargs = _get_kwargs(
+        endpoint_id=endpoint_id,
+        include_template=include_template,
+        include_workers=include_workers,
+    )
+
+    response = client.get_httpx_client().request(
+        **kwargs,
+    )
+
+    return _build_response(client=client, response=response)
+
+
+def sync(
+    endpoint_id: str,
+    *,
+    client: AuthenticatedClient | Client,
+    include_template: bool | Unset = False,
+    include_workers: bool | Unset = False,
+) -> Any | Endpoint | None:
+    """Find an endpoint by ID
+
+     Returns a single endpoint.
+
+    Args:
+        endpoint_id (str):
+        include_template (bool | Unset): Include information about the template used to create the
+            endpoint. Default: False. Example: True.
+        include_workers (bool | Unset): Include information about the workers running on the
+            endpoint. Default: False. Example: True.
+
+    Raises:
+        errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.
+        httpx.TimeoutException: If the request takes longer than Client.timeout.
+
+    Returns:
+        Any | Endpoint
+    """
+
+    return sync_detailed(
+        endpoint_id=endpoint_id,
+        client=client,
+        include_template=include_template,
+        include_workers=include_workers,
+    ).parsed
+
+
+async def asyncio_detailed(
+    endpoint_id: str,
+    *,
+    client: AuthenticatedClient | Client,
+    include_template: bool | Unset = False,
+    include_workers: bool | Unset = False,
+) -> Response[Any | Endpoint]:
+    """Find an endpoint by ID
+
+     Returns a single endpoint.
+
+    Args:
+        endpoint_id (str):
+        include_template (bool | Unset): Include information about the template used to create the
+            endpoint. Default: False. Example: True.
+        include_workers (bool | Unset): Include information about the workers running on the
+            endpoint. Default: False. Example: True.
+
+    Raises:
+        errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.
+        httpx.TimeoutException: If the request takes longer than Client.timeout.
+
+    Returns:
+        Response[Any | Endpoint]
+    """
+
+    kwargs = _get_kwargs(
+        endpoint_id=endpoint_id,
+        include_template=include_template,
+        include_workers=include_workers,
+    )
+
+    response = await client.get_async_httpx_client().request(**kwargs)
+
+    return _build_response(client=client, response=response)
+
+
+async def asyncio(
+    endpoint_id: str,
+    *,
+    client: AuthenticatedClient | Client,
+    include_template: bool | Unset = False,
+    include_workers: bool | Unset = False,
+) -> Any | Endpoint | None:
+    """Find an endpoint by ID
+
+     Returns a single endpoint.
+
+    Args:
+        endpoint_id (str):
+        include_template (bool | Unset): Include information about the template used to create the
+            endpoint. Default: False. Example: True.
+        include_workers (bool | Unset): Include information about the workers running on the
+            endpoint. Default: False. Example: True.
+
+    Raises:
+        errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.
+        httpx.TimeoutException: If the request takes longer than Client.timeout.
+
+    Returns:
+        Any | Endpoint
+    """
+
+    return (
+        await asyncio_detailed(
+            endpoint_id=endpoint_id,
+            client=client,
+            include_template=include_template,
+            include_workers=include_workers,
+        )
+    ).parsed

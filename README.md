@@ -86,21 +86,33 @@ The default worker expects a network volume mounted at `/runpod-volume`, runs th
 
 ## Build And Install
 
-Build the standalone CLI executable with:
+Build the package distributions with:
 
 ```bash
 just build-cli
 ```
 
-This writes the binary to `dist/quadra`.
+This writes a wheel and source distribution to `dist/`.
 
-Install it into `~/.local/bin` with:
+Install the current checkout as a uv-managed CLI tool with:
 
 ```bash
 just install-cli
 ```
 
-That command symlinks `dist/quadra` to `~/.local/bin/quadra`.
+That command force-reinstalls `quadra` in editable mode via `uv tool install`, so local source changes are reflected without rebuilding. If `quadra` is not on your `PATH`, run `uv tool update-shell`.
+
+## Regenerate RunPod REST Client
+
+Quadra vendors generated control-plane client code under `src/quadra/_generated/runpod_rest_client/`.
+
+Regenerate it from RunPod's official REST OpenAPI spec with:
+
+```bash
+just generate-runpod-rest-client
+```
+
+That script fetches `https://rest.runpod.io/v1/openapi.json` and re-runs `openapi-python-client`, so it requires outbound network access.
 
 ## Project Layout
 
