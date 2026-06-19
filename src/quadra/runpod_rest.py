@@ -13,10 +13,10 @@ from quadra._generated.runpod_rest_client.api.endpoints import (
     create_endpoint as create_endpoint_api,
 )
 from quadra._generated.runpod_rest_client.api.endpoints import (
-    list_endpoints as list_endpoints_api,
-)
-from quadra._generated.runpod_rest_client.api.endpoints import (
     update_endpoint as update_endpoint_api,
+)
+from quadra._generated.runpod_rest_client.api.network_volumes import (
+    create_network_volume as create_network_volume_api,
 )
 from quadra._generated.runpod_rest_client.api.network_volumes import (
     list_network_volumes as list_network_volumes_api,
@@ -25,7 +25,13 @@ from quadra._generated.runpod_rest_client.api.templates import (
     create_template as create_template_api,
 )
 from quadra._generated.runpod_rest_client.api.templates import (
+    get_template as get_template_api,
+)
+from quadra._generated.runpod_rest_client.api.templates import (
     list_templates as list_templates_api,
+)
+from quadra._generated.runpod_rest_client.api.templates import (
+    update_template as update_template_api,
 )
 from quadra._generated.runpod_rest_client.errors import UnexpectedStatus
 from quadra._generated.runpod_rest_client.models.endpoint_create_input import (
@@ -34,14 +40,23 @@ from quadra._generated.runpod_rest_client.models.endpoint_create_input import (
 from quadra._generated.runpod_rest_client.models.endpoint_create_input_gpu_type_ids_item import (
     EndpointCreateInputGpuTypeIdsItem,
 )
+from quadra._generated.runpod_rest_client.models.endpoint import Endpoint
 from quadra._generated.runpod_rest_client.models.endpoint_update_input import (
     EndpointUpdateInput,
+)
+from quadra._generated.runpod_rest_client.models.network_volume import NetworkVolume
+from quadra._generated.runpod_rest_client.models.network_volume_create_input import (
+    NetworkVolumeCreateInput,
 )
 from quadra._generated.runpod_rest_client.models.network_volumes_item import (
     NetworkVolumesItem,
 )
+from quadra._generated.runpod_rest_client.models.template import Template
 from quadra._generated.runpod_rest_client.models.template_create_input import (
     TemplateCreateInput,
+)
+from quadra._generated.runpod_rest_client.models.template_update_input import (
+    TemplateUpdateInput,
 )
 from quadra._generated.runpod_rest_client.types import Response
 from quadra.errors import QuadraError
@@ -146,6 +161,7 @@ def build_template_create_body(
     ports: tuple[str, ...],
     docker_entrypoint: tuple[str, ...],
     docker_start_cmd: tuple[str, ...],
+    volume_mount_path: str,
     env: dict[str, str],
     container_disk_gb: int,
     readme: str,
@@ -162,11 +178,57 @@ def build_template_create_body(
         payload["dockerEntrypoint"] = list(docker_entrypoint)
     if docker_start_cmd:
         payload["dockerStartCmd"] = list(docker_start_cmd)
+    if volume_mount_path:
+        payload["volumeMountPath"] = volume_mount_path
     if env:
         payload["env"] = env
     if readme:
         payload["readme"] = readme
     return TemplateCreateInput.from_dict(payload)
+
+
+def build_template_update_body(
+    *,
+    name: str,
+    image_name: str,
+    ports: tuple[str, ...],
+    docker_entrypoint: tuple[str, ...],
+    docker_start_cmd: tuple[str, ...],
+    volume_mount_path: str,
+    env: dict[str, str],
+    container_disk_gb: int,
+    readme: str,
+) -> TemplateUpdateInput:
+    payload: dict[str, Any] = {
+        "name": name,
+        "imageName": image_name,
+        "containerDiskInGb": container_disk_gb,
+    }
+    payload["ports"] = list(ports)
+    payload["dockerEntrypoint"] = list(docker_entrypoint)
+    payload["dockerStartCmd"] = list(docker_start_cmd)
+    payload["volumeMountPath"] = volume_mount_path
+    payload["env"] = env
+    payload["readme"] = readme
+    return TemplateUpdateInput.from_dict(payload)
+
+
+def build_network_volume_create_body(
+    *, name: str, data_center_id: str, size_gb: int
+) -> NetworkVolumeCreateInput:
+    normalized_name = name.strip()
+    if not normalized_name:
+        raise QuadraError("RunPod network volume name must not be empty.")
+    normalized_data_center_id = data_center_id.strip()
+    if not normalized_data_center_id:
+        raise QuadraError("RunPod network volume datacenter must not be empty.")
+    if size_gb <= 0:
+        raise QuadraError("RunPod network volume size must be greater than 0 GB.")
+    return NetworkVolumeCreateInput(
+        data_center_id=normalized_data_center_id,
+        name=normalized_name,
+        size=size_gb,
+    )
 
 
 def build_endpoint_create_body(
@@ -291,6 +353,27 @@ def _response_error_message(response: Response[Any]) -> str:
     return text
 
 
+def _parse_unexpected_success(
+    *,
+    status_code: int,
+    content: bytes,
+    success_parser: Callable[[Any], Any] | None,
+    invalid_response_message: str,
+) -> Any | None:
+    if success_parser is None:
+        return None
+    if status_code < HTTPStatus.OK or status_code >= HTTPStatus.MULTIPLE_CHOICES:
+        return None
+    try:
+        payload = json.loads(content.decode("utf-8", errors="replace"))
+    except ValueError as exc:
+        raise QuadraError("RunPod returned an invalid JSON response.") from exc
+    try:
+        return success_parser(payload)
+    except (TypeError, ValueError, KeyError) as exc:
+        raise QuadraError(invalid_response_message) from exc
+
+
 class RunpodRestClient:
     def __init__(self, api_key: str):
         self._client = AuthenticatedClient(
@@ -303,11 +386,39 @@ class RunpodRestClient:
             raise_on_unexpected_status=True,
         )
 
+    def _request_json(
+        self,
+        method: str,
+        path: str,
+        *,
+        params: dict[str, Any] | None = None,
+    ) -> Any:
+        client = self._client.get_httpx_client()
+        try:
+            response = client.request(method, path, params=params)
+        except httpx.TimeoutException as exc:
+            raise QuadraError(f"RunPod request timed out: {exc}") from exc
+        except httpx.HTTPError as exc:
+            raise QuadraError(f"RunPod request failed: {exc}") from exc
+
+        if response.status_code == HTTPStatus.UNAUTHORIZED:
+            raise QuadraError("Unauthorized request, please check your RunPod API key.")
+        if response.status_code >= HTTPStatus.BAD_REQUEST:
+            raise QuadraError(
+                f"RunPod returned HTTP {response.status_code}: "
+                f"{_response_error_message(response)}"
+            )
+        try:
+            return response.json()
+        except ValueError as exc:
+            raise QuadraError("RunPod returned an invalid JSON response.") from exc
+
     def _request(
         self,
         fn: Callable[..., Response[Any]],
         *,
         invalid_response_message: str,
+        unexpected_success_parser: Callable[[Any], Any] | None = None,
         **kwargs: Any,
     ) -> Any:
         try:
@@ -317,6 +428,14 @@ class RunpodRestClient:
                 raise QuadraError(
                     "Unauthorized request, please check your RunPod API key."
                 ) from exc
+            parsed = _parse_unexpected_success(
+                status_code=exc.status_code,
+                content=exc.content,
+                success_parser=unexpected_success_parser,
+                invalid_response_message=invalid_response_message,
+            )
+            if parsed is not None:
+                return parsed
             message = exc.content.decode("utf-8", errors="replace").strip()
             raise QuadraError(
                 f"RunPod returned HTTP {exc.status_code}: {message or exc.status_code}"
@@ -348,6 +467,21 @@ class RunpodRestClient:
             raise QuadraError("RunPod returned an invalid network volume list response.")
         return [item.to_dict() for item in payload if isinstance(item, NetworkVolumesItem)]
 
+    def create_network_volume(
+        self, *, name: str, data_center_id: str, size_gb: int
+    ) -> dict[str, Any]:
+        payload = self._request(
+            create_network_volume_api.sync_detailed,
+            invalid_response_message="RunPod returned an invalid network volume create response.",
+            unexpected_success_parser=NetworkVolume.from_dict,
+            body=build_network_volume_create_body(
+                name=name,
+                data_center_id=data_center_id,
+                size_gb=size_gb,
+            ),
+        )
+        return payload.to_dict()
+
     def get_templates(self) -> list[dict[str, Any]]:
         payload = self._request(
             list_templates_api.sync_detailed,
@@ -357,6 +491,14 @@ class RunpodRestClient:
             raise QuadraError("RunPod returned an invalid template list response.")
         return [item.to_dict() for item in payload]
 
+    def get_template(self, template_id: str) -> dict[str, Any]:
+        payload = self._request(
+            get_template_api.sync_detailed,
+            invalid_response_message="RunPod returned an invalid template response.",
+            template_id=template_id,
+        )
+        return payload.to_dict()
+
     def create_template(
         self,
         *,
@@ -365,6 +507,7 @@ class RunpodRestClient:
         ports: tuple[str, ...],
         docker_entrypoint: tuple[str, ...],
         docker_start_cmd: tuple[str, ...],
+        volume_mount_path: str,
         env: dict[str, str],
         container_disk_gb: int,
         readme: str,
@@ -372,12 +515,46 @@ class RunpodRestClient:
         payload = self._request(
             create_template_api.sync_detailed,
             invalid_response_message="RunPod returned an invalid template create response.",
+            unexpected_success_parser=Template.from_dict,
             body=build_template_create_body(
                 name=name,
                 image_name=image_name,
                 ports=ports,
                 docker_entrypoint=docker_entrypoint,
                 docker_start_cmd=docker_start_cmd,
+                volume_mount_path=volume_mount_path,
+                env=env,
+                container_disk_gb=container_disk_gb,
+                readme=readme,
+            ),
+        )
+        return payload.to_dict()
+
+    def update_template(
+        self,
+        template_id: str,
+        *,
+        name: str,
+        image_name: str,
+        ports: tuple[str, ...],
+        docker_entrypoint: tuple[str, ...],
+        docker_start_cmd: tuple[str, ...],
+        volume_mount_path: str,
+        env: dict[str, str],
+        container_disk_gb: int,
+        readme: str,
+    ) -> dict[str, Any]:
+        payload = self._request(
+            update_template_api.sync_detailed,
+            invalid_response_message="RunPod returned an invalid template update response.",
+            template_id=template_id,
+            body=build_template_update_body(
+                name=name,
+                image_name=image_name,
+                ports=ports,
+                docker_entrypoint=docker_entrypoint,
+                docker_start_cmd=docker_start_cmd,
+                volume_mount_path=volume_mount_path,
                 env=env,
                 container_disk_gb=container_disk_gb,
                 readme=readme,
@@ -386,13 +563,39 @@ class RunpodRestClient:
         return payload.to_dict()
 
     def get_endpoints(self) -> list[dict[str, Any]]:
-        payload = self._request(
-            list_endpoints_api.sync_detailed,
-            invalid_response_message="RunPod returned an invalid endpoint list response.",
-        )
+        payload = self._request_json("GET", "/endpoints")
         if not isinstance(payload, list):
             raise QuadraError("RunPod returned an invalid endpoint list response.")
-        return [item.to_dict() for item in payload]
+        return [item for item in payload if isinstance(item, dict)]
+
+    def get_endpoint(
+        self, endpoint_id: str, *, include_workers: bool = False
+    ) -> dict[str, Any]:
+        payload = self._request_json(
+            "GET",
+            f"/endpoints/{endpoint_id}",
+            params={"includeWorkers": include_workers},
+        )
+        if not isinstance(payload, dict):
+            raise QuadraError("RunPod returned an invalid endpoint response.")
+        return payload
+
+    def delete_endpoint(self, endpoint_id: str) -> None:
+        client = self._client.get_httpx_client()
+        try:
+            response = client.request("DELETE", f"/endpoints/{endpoint_id}")
+        except httpx.TimeoutException as exc:
+            raise QuadraError(f"RunPod request timed out: {exc}") from exc
+        except httpx.HTTPError as exc:
+            raise QuadraError(f"RunPod request failed: {exc}") from exc
+
+        if response.status_code == HTTPStatus.UNAUTHORIZED:
+            raise QuadraError("Unauthorized request, please check your RunPod API key.")
+        if response.status_code >= HTTPStatus.BAD_REQUEST:
+            raise QuadraError(
+                f"RunPod returned HTTP {response.status_code}: "
+                f"{_response_error_message(response)}"
+            )
 
     def create_endpoint(
         self,
@@ -415,6 +618,7 @@ class RunpodRestClient:
         payload = self._request(
             create_endpoint_api.sync_detailed,
             invalid_response_message="RunPod returned an invalid endpoint create response.",
+            unexpected_success_parser=Endpoint.from_dict,
             body=build_endpoint_create_body(
                 name=name,
                 template_id=template_id,

@@ -8,13 +8,61 @@ from pathlib import Path
 from typing import Any
 
 
+WORKER_BOOTSTRAP_LOG_PATH = Path(__file__).resolve().parent / ".quadra" / "worker-bootstrap.log"
+RUN_MANIFEST_FILENAME = "run-manifest.json"
+
+
 def _now() -> str:
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+
+def _append_bootstrap_log(message: str) -> None:
+    WORKER_BOOTSTRAP_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+    with WORKER_BOOTSTRAP_LOG_PATH.open("a", encoding="utf-8") as handle:
+        handle.write(f"[runpod worker] {_now()} {message}\n")
 
 
 def _write_status(path: Path, payload: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+
+def _write_run_manifest(path: Path, *, run_dir: Path, run_id: str, status: str) -> None:
+    files = sorted(
+        file_path.relative_to(run_dir).as_posix()
+        for file_path in run_dir.rglob("*")
+        if file_path.is_file() and file_path.name != RUN_MANIFEST_FILENAME
+    )
+    path.write_text(
+        json.dumps(
+            {
+                "run_id": run_id,
+                "status": status,
+                "files": files,
+            },
+            indent=2,
+            sort_keys=True,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+
+def _persist_run_state(
+    *,
+    run_dir: Path,
+    run_id: str,
+    status_path: Path,
+    manifest_path: Path,
+    status_payload: dict[str, Any],
+) -> None:
+    _write_status(status_path, status_payload)
+    _write_run_manifest(
+        manifest_path,
+        run_dir=run_dir,
+        run_id=run_id,
+        status=str(status_payload.get("status", "unknown")),
+    )
 
 
 def _run_shell(
@@ -43,6 +91,7 @@ def _run_shell(
 def handler(job: dict[str, Any]) -> dict[str, Any]:
     payload = (job or {}).get("input") or {}
     spec = payload.get("quadra") if isinstance(payload.get("quadra"), dict) else payload
+    _append_bootstrap_log("handler invoked")
 
     required = ["project_name", "run_id", "project_dir", "experiment_dir", "run_dir", "command"]
     missing = [key for key in required if not spec.get(key)]
@@ -59,6 +108,7 @@ def handler(job: dict[str, Any]) -> dict[str, Any]:
     stdout_path = run_dir / "stdout.log"
     stderr_path = run_dir / "stderr.log"
     status_path = run_dir / "status.json"
+    manifest_path = run_dir / RUN_MANIFEST_FILENAME
 
     run_dir.mkdir(parents=True, exist_ok=True)
     artifacts_dir.mkdir(parents=True, exist_ok=True)
@@ -79,7 +129,13 @@ def handler(job: dict[str, Any]) -> dict[str, Any]:
         "setup_command": spec.get("setup_command"),
         "command": spec["command"],
     }
-    _write_status(status_path, status_payload)
+    _persist_run_state(
+        run_dir=run_dir,
+        run_id=run_id,
+        status_path=status_path,
+        manifest_path=manifest_path,
+        status_payload=status_payload,
+    )
 
     if not project_dir.exists():
         status_payload.update(
@@ -90,7 +146,13 @@ def handler(job: dict[str, Any]) -> dict[str, Any]:
                 "error": f"Project directory does not exist: {project_dir}",
             }
         )
-        _write_status(status_path, status_payload)
+        _persist_run_state(
+            run_dir=run_dir,
+            run_id=run_id,
+            status_path=status_path,
+            manifest_path=manifest_path,
+            status_payload=status_payload,
+        )
         raise RuntimeError(status_payload["error"])
 
     if not experiment_dir.exists():
@@ -102,7 +164,13 @@ def handler(job: dict[str, Any]) -> dict[str, Any]:
                 "error": f"Experiment directory does not exist: {experiment_dir}",
             }
         )
-        _write_status(status_path, status_payload)
+        _persist_run_state(
+            run_dir=run_dir,
+            run_id=run_id,
+            status_path=status_path,
+            manifest_path=manifest_path,
+            status_payload=status_payload,
+        )
         raise RuntimeError(status_payload["error"])
 
     setup_command = spec.get("setup_command")
@@ -124,7 +192,13 @@ def handler(job: dict[str, Any]) -> dict[str, Any]:
                     "error": f"Setup command failed with exit code {setup_result.returncode}",
                 }
             )
-            _write_status(status_path, status_payload)
+            _persist_run_state(
+                run_dir=run_dir,
+                run_id=run_id,
+                status_path=status_path,
+                manifest_path=manifest_path,
+                status_payload=status_payload,
+            )
             raise RuntimeError(status_payload["error"])
 
     command_result = _run_shell(
@@ -144,7 +218,13 @@ def handler(job: dict[str, Any]) -> dict[str, Any]:
                 "error": f"Command failed with exit code {command_result.returncode}",
             }
         )
-        _write_status(status_path, status_payload)
+        _persist_run_state(
+            run_dir=run_dir,
+            run_id=run_id,
+            status_path=status_path,
+            manifest_path=manifest_path,
+            status_payload=status_payload,
+        )
         raise RuntimeError(status_payload["error"])
 
     status_payload.update(
@@ -154,7 +234,13 @@ def handler(job: dict[str, Any]) -> dict[str, Any]:
             "exit_code": 0,
         }
     )
-    _write_status(status_path, status_payload)
+    _persist_run_state(
+        run_dir=run_dir,
+        run_id=run_id,
+        status_path=status_path,
+        manifest_path=manifest_path,
+        status_payload=status_payload,
+    )
     return {
         "run_id": run_id,
         "status": "completed",
@@ -164,13 +250,19 @@ def handler(job: dict[str, Any]) -> dict[str, Any]:
 
 
 def main() -> None:
+    _append_bootstrap_log("worker process starting")
+    runpod_env_keys = sorted(key for key in os.environ if key.startswith("RUNPOD"))
+    _append_bootstrap_log(f"runpod env keys: {', '.join(runpod_env_keys) or '<none>'}")
     try:
         import runpod
     except ImportError as exc:
+        _append_bootstrap_log("failed to import runpod")
         raise RuntimeError(
             "The worker image is missing the `runpod` package required for serverless startup."
         ) from exc
 
+    _append_bootstrap_log("imported runpod")
+    _append_bootstrap_log("starting runpod.serverless.start")
     runpod.serverless.start({"handler": handler})
 
 

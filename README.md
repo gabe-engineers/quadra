@@ -29,7 +29,6 @@ For the built-in workflow shortcuts:
 
 ```bash
 quadra smoke
-quadra bench
 ```
 
 If you are already inside the target directory, `quadra init` also works without a
@@ -44,12 +43,16 @@ quadra init
 ## Core Commands
 
 - `quadra init [project_name]` scaffolds a Quadra project in a new or current directory.
+  Re-running it is safe: missing scaffold files are recreated and existing files are preserved.
 - `quadra sync` pushes the local project into the configured RunPod network volume.
+  If the configured volume does not exist yet, Quadra can offer to create one or
+  link the project to an existing compatible volume interactively.
+  Sync keeps a small remote manifest under `.quadra/` and only re-uploads files whose contents changed.
 - `quadra submit <workflow>` submits a workflow job to the configured Serverless endpoint.
 - `quadra logs` streams logs for the most recently submitted run.
 - `quadra pull [run_id] [destination]` downloads a completed run into `runs/<run_id>/`.
-- `quadra smoke` and `quadra bench` run the full sync-submit-logs-pull loop for the named workflow.
-  They print sync, submit, polling, and pull progress as they run.
+- `quadra smoke` runs the full sync-submit-logs-pull loop for the default workflow.
+  In the default scaffold, `smoke` runs `python main.py`.
 
 ## RunPod Serverless Model
 
@@ -74,13 +77,15 @@ By default, Quadra creates a serverless template that starts:
 python -u /runpod-volume/projects/<project_name>/quadra_worker.py
 ```
 
-That worker script is scaffolded into the project root by `quadra init`, synced into the network volume by `quadra sync`, and can be replaced by editing `[runtime.runpod.template]` in `quadra.toml`.
+That worker script can be replaced by editing `[runtime.runpod.template]` in `quadra.toml`.
 
-The default worker expects a network volume mounted at `/runpod-volume`, runs the configured setup command, executes the workflow inside `src/experiment`, and writes logs, status, and artifacts under:
+The default worker configures the serverless template to mount the RunPod network volume at `/runpod-volume`, runs the configured setup command, executes the workflow inside `src/experiment`, and writes logs, status, and artifacts under:
 
 ```text
 /runpod-volume/projects/<project_name>/runs/<run_id>/
 ```
+
+The scaffolded default uses a public CUDA-enabled `pytorch/pytorch` runtime image, bootstraps the `runpod` worker package into an isolated runtime under `/runpod-volume/projects/<project_name>/.quadra/worker-runtime`, writes worker startup traces to `/runpod-volume/projects/<project_name>/.quadra/worker-bootstrap.log`, and uses a `setup_command` that bootstraps `uv` into an isolated runtime under `/runpod-volume/projects/<project_name>/.quadra/uv-runtime` only when the image does not already provide it.
 
 `timeout_seconds` in `runtime.runpod` is applied to the endpoint execution timeout when Quadra creates the endpoint.
 
@@ -130,9 +135,6 @@ That script fetches `https://rest.runpod.io/v1/openapi.json` and re-runs `openap
     experiment/
       pyproject.toml
       main.py
-      scripts/
-        smoke.py
-        bench.py
   models/
   caches/
   runs/
