@@ -5,7 +5,9 @@ import json
 import os
 import posixpath
 import re
+import subprocess
 import unittest
+import venv
 from contextlib import chdir
 from datetime import datetime, timedelta, timezone
 from http import HTTPStatus
@@ -21,6 +23,7 @@ from quadra._generated.runpod_rest_client.models.endpoint import Endpoint
 from quadra._generated.runpod_rest_client.models.template import Template
 from quadra._generated.runpod_rest_client.types import Response
 from quadra.cli import (
+    DEFAULT_TEMPLATE_BOOTSTRAP_COMMAND,
     RunpodClient,
     cli,
     load_banner_text,
@@ -1908,6 +1911,149 @@ class QuadraCLITestCase(unittest.TestCase):
             self.assertEqual(
                 fake_client.submissions[0]["payload"]["quadra"]["command"],
                 "python main.py",
+            )
+
+    def _render_bootstrap(self, project_dir: Path) -> str:
+        worker_path = project_dir / "quadra_worker.py"
+        bootstrap_log = project_dir / ".quadra" / "bootstrap.log"
+        worker_runtime = project_dir / ".quadra" / "worker-runtime"
+        return (
+            DEFAULT_TEMPLATE_BOOTSTRAP_COMMAND.replace("{worker_path}", str(worker_path))
+            .replace("{worker_bootstrap_log_path}", str(bootstrap_log))
+            .replace("{worker_runtime_path}", str(worker_runtime))
+            .replace("{project_dir}", str(project_dir))
+        )
+
+    @staticmethod
+    def _worker_script_source() -> str:
+        return (
+            "import json, os, sys\n"
+            "record = {\n"
+            "    'executable': sys.executable,\n"
+            "    'prefix': sys.prefix,\n"
+            "    'base_prefix': getattr(sys, 'base_prefix', sys.prefix),\n"
+            "}\n"
+            "try:\n"
+            "    import runpod\n"
+            "    record['has_runpod'] = True\n"
+            "except ImportError:\n"
+            "    record['has_runpod'] = False\n"
+            "with open(os.environ['QUADRA_RECORD_PATH'], 'w') as fh:\n"
+            "    json.dump(record, fh)\n"
+        )
+
+    @staticmethod
+    def _fake_runpod_module_source() -> str:
+        return (
+            "class _Serverless:\n"
+            "    @staticmethod\n"
+            "    def start(_config):\n"
+            "        return None\n"
+            "serverless = _Serverless()\n"
+        )
+
+    def test_bootstrap_launches_worker_with_isolated_runtime_that_has_runpod(self) -> None:
+        with self.runner.isolated_filesystem() as root:
+            project_dir = Path(root) / "project"
+            project_dir.mkdir()
+            worker_path = project_dir / "quadra_worker.py"
+            worker_runtime = project_dir / ".quadra" / "worker-runtime"
+            record_path = project_dir / "launch_record.json"
+            bootstrap_log = project_dir / ".quadra" / "bootstrap.log"
+
+            worker_path.write_text(self._worker_script_source(), encoding="utf-8")
+
+            venv.create(worker_runtime, with_pip=False, symlinks=True, clear=True)
+            venv_python = worker_runtime / "bin" / "python"
+            site_packages = subprocess.check_output(
+                [str(venv_python), "-c", "import site; print(site.getsitepackages()[0])"],
+                text=True,
+            ).strip()
+            Path(site_packages).mkdir(parents=True, exist_ok=True)
+            (Path(site_packages) / "runpod.py").write_text(
+                self._fake_runpod_module_source(), encoding="utf-8"
+            )
+
+            env = dict(os.environ)
+            env["QUADRA_RECORD_PATH"] = str(record_path)
+            completed = subprocess.run(
+                ["/bin/sh", "-lc", self._render_bootstrap(project_dir)],
+                env=env,
+                capture_output=True,
+                text=True,
+            )
+            log_text = (
+                bootstrap_log.read_text(encoding="utf-8", errors="replace")
+                if bootstrap_log.exists()
+                else "<missing>"
+            )
+            self.assertEqual(
+                completed.returncode,
+                0,
+                f"bootstrap exited {completed.returncode}\n"
+                f"stdout:\n{completed.stdout}\nstderr:\n{completed.stderr}\n"
+                f"bootstrap log:\n{log_text}",
+            )
+            self.assertTrue(record_path.exists(), f"worker was not launched\nbootstrap log:\n{log_text}")
+            record = json.loads(record_path.read_text(encoding="utf-8"))
+            self.assertTrue(
+                record["has_runpod"],
+                f"worker could not import runpod\nrecord:{record}\nbootstrap log:\n{log_text}",
+            )
+            self.assertEqual(
+                Path(record["prefix"]).resolve(),
+                worker_runtime.resolve(),
+                f"worker was not launched from the isolated venv\nrecord:{record}",
+            )
+
+    def test_bootstrap_launches_worker_with_isolated_package_directory_when_venv_lacks_pip(self) -> None:
+        with self.runner.isolated_filesystem() as root:
+            project_dir = Path(root) / "project"
+            project_dir.mkdir()
+            worker_path = project_dir / "quadra_worker.py"
+            worker_runtime = project_dir / ".quadra" / "worker-runtime"
+            worker_site_packages = project_dir / ".quadra" / "worker-site-packages"
+            record_path = project_dir / "launch_record.json"
+            bootstrap_log = project_dir / ".quadra" / "bootstrap.log"
+
+            worker_path.write_text(self._worker_script_source(), encoding="utf-8")
+
+            venv.create(worker_runtime, with_pip=False, symlinks=True, clear=True)
+            worker_site_packages.mkdir(parents=True, exist_ok=True)
+            (worker_site_packages / "runpod.py").write_text(
+                self._fake_runpod_module_source(), encoding="utf-8"
+            )
+
+            env = dict(os.environ)
+            env["QUADRA_RECORD_PATH"] = str(record_path)
+            completed = subprocess.run(
+                ["/bin/sh", "-lc", self._render_bootstrap(project_dir)],
+                env=env,
+                capture_output=True,
+                text=True,
+            )
+            log_text = (
+                bootstrap_log.read_text(encoding="utf-8", errors="replace")
+                if bootstrap_log.exists()
+                else "<missing>"
+            )
+            self.assertEqual(
+                completed.returncode,
+                0,
+                f"bootstrap exited {completed.returncode}\n"
+                f"stdout:\n{completed.stdout}\nstderr:\n{completed.stderr}\n"
+                f"bootstrap log:\n{log_text}",
+            )
+            self.assertTrue(record_path.exists(), f"worker was not launched\nbootstrap log:\n{log_text}")
+            record = json.loads(record_path.read_text(encoding="utf-8"))
+            self.assertTrue(
+                record["has_runpod"],
+                f"worker could not import runpod\nrecord:{record}\nbootstrap log:\n{log_text}",
+            )
+            self.assertNotEqual(
+                Path(record["prefix"]).resolve(),
+                worker_runtime.resolve(),
+                f"worker should run with system python via PYTHONPATH, not the venv\nrecord:{record}",
             )
 
     def test_submit_updates_existing_template_when_mount_path_is_wrong(self) -> None:
