@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import io
 import json
+import os
 import posixpath
 import re
 import unittest
@@ -448,6 +449,14 @@ class ExitedWorkerPollingFakeRunpodClient(PollingFakeRunpodClient):
 class QuadraCLITestCase(unittest.TestCase):
     def setUp(self) -> None:
         self.runner = CliRunner()
+        self.env_patcher = patch.dict(
+            os.environ,
+            {"QUADRA_CONFIG": str(Path.cwd() / ".quadra-test-global.toml")},
+        )
+        self.env_patcher.start()
+
+    def tearDown(self) -> None:
+        self.env_patcher.stop()
 
     def test_build_endpoint_create_body_maps_quadra_fields_to_rest(self) -> None:
         body = build_endpoint_create_body(
@@ -940,7 +949,7 @@ class QuadraCLITestCase(unittest.TestCase):
                 scaler_type="QUEUE_DELAY",
                 scaler_value=4,
                 workers_min=0,
-                workers_max=3,
+                workers_max=1,
                 flashboot=False,
                 allowed_cuda_versions=(),
                 gpu_count=1,
@@ -979,7 +988,6 @@ class QuadraCLITestCase(unittest.TestCase):
         self.assertEqual(result.exit_code, 0)
         self.assertFalse(result.output.startswith(load_banner_text(color=False)))
         self.assertIn("Usage:", result.output)
-        self.assertNotIn("bench", result.output)
 
     def test_init_creates_serverless_contract(self) -> None:
         with self.runner.isolated_filesystem():
@@ -1039,7 +1047,6 @@ class QuadraCLITestCase(unittest.TestCase):
             )
             self.assertIn('smoke = "python main.py"', config)
             self.assertIn('main = "python main.py"', config)
-            self.assertNotIn('bench = "python scripts/bench.py"', config)
             self.assertIn("# Valid serverless gpu_ids pool IDs:", config)
             self.assertIn('#   ADA_24        24 GB    RTX 4090', config)
             self.assertIn(
@@ -1062,6 +1069,186 @@ class QuadraCLITestCase(unittest.TestCase):
                 self.assertIn("initialized bonsai", result.output)
                 self.assertIn('name = "bonsai"', Path("quadra.toml").read_text(encoding="utf-8"))
                 self.assertEqual(Path("README.md").read_text(encoding="utf-8"), "# bonsai\n")
+
+    def test_global_config_supplies_shared_runpod_backend(self) -> None:
+        with self.runner.isolated_filesystem():
+            global_config = Path("global-quadra.toml").resolve()
+            global_config.write_text(
+                "\n".join(
+                    [
+                        "[runpod]",
+                        'api_key_env = "RUNPOD_API_KEY"',
+                        'default_data_center_id = "US-IL-1"',
+                        "",
+                        "[runpod.network_volume]",
+                        'name = "quadra-dev"',
+                        "size_gb = 80",
+                        'mount_path = "/runpod-volume"',
+                        "",
+                        "[runpod.serverless]",
+                        'endpoint_name = "quadra-dev"',
+                        'gpu_ids = "ADA_24"',
+                        "workers_max = 1",
+                        "timeout_seconds = 900",
+                        "",
+                        "[runpod.template]",
+                        'name = "quadra-dev-serverless-worker"',
+                        'image_name = "custom/image:latest"',
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            project_root = Path("bonsai")
+            (project_root / "src" / "experiment").mkdir(parents=True)
+            (project_root / "quadra.toml").write_text(
+                "\n".join(
+                    [
+                        "[project]",
+                        'name = "bonsai"',
+                        "",
+                        "[commands]",
+                        'smoke = "python main.py"',
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            (project_root / "src" / "experiment" / "main.py").write_text(
+                "print('ok')\n",
+                encoding="utf-8",
+            )
+            fake_s3 = FakeS3Client()
+            fake_client = FakeRunpodClient(fake_s3)
+            fake_client.volume["name"] = "quadra-dev"
+
+            with patch.dict(os.environ, {"QUADRA_CONFIG": str(global_config)}):
+                with chdir(project_root):
+                    config = load_project()
+                    self.assertEqual(config.runtime.runpod.network_volume_name, "quadra-dev")
+                    self.assertEqual(config.runtime.runpod.endpoint_name, "quadra-dev")
+                    self.assertEqual(
+                        config.runtime.runpod.template.name,
+                        "quadra-dev-serverless-worker",
+                    )
+                    self.assertEqual(config.runtime.runpod.template.image_name, "custom/image:latest")
+                    self.assertEqual(config.runtime.runpod.network_volume_size_gb, 80)
+
+                    with patch("quadra.cli.load_runpod_client", return_value=fake_client):
+                        with patch("quadra.cli.build_s3_client", return_value=fake_s3):
+                            sync_result = self.runner.invoke(cli, ["sync"])
+                            submit_result = self.runner.invoke(cli, ["submit", "smoke"])
+
+            self.assertEqual(sync_result.exit_code, 0, sync_result.output)
+            self.assertEqual(submit_result.exit_code, 0, submit_result.output)
+            self.assertEqual(fake_client.created_templates[0]["name"], "quadra-dev-serverless-worker")
+            self.assertEqual(fake_client.created_templates[0]["image_name"], "custom/image:latest")
+            self.assertIn(
+                "/runpod-volume/.quadra/quadra_worker.py",
+                fake_client.created_templates[0]["docker_start_cmd"][2],
+            )
+            self.assertEqual(fake_client.created_endpoints[0]["name"], "quadra-dev")
+            self.assertIn(".quadra/quadra_worker.py", fake_s3.objects)
+
+    def test_init_uses_lean_project_config_when_global_config_exists(self) -> None:
+        with self.runner.isolated_filesystem():
+            global_config = Path("global-quadra.toml").resolve()
+            global_config.write_text(
+                "\n".join(
+                    [
+                        "[runpod.network_volume]",
+                        'name = "quadra-dev"',
+                        "",
+                        "[runpod.serverless]",
+                        'endpoint_name = "quadra-dev"',
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            with patch.dict(os.environ, {"QUADRA_CONFIG": str(global_config)}):
+                result = self.runner.invoke(cli, ["init", "bonsai"])
+
+            self.assertEqual(result.exit_code, 0, result.output)
+            config = Path("bonsai/quadra.toml").read_text(encoding="utf-8")
+            self.assertIn("[project]", config)
+            self.assertIn("[paths]", config)
+            self.assertIn("[commands]", config)
+            self.assertNotIn("[runtime.runpod]", config)
+            self.assertNotIn("endpoint_name", config)
+            self.assertNotIn("network_volume_name", config)
+
+    def test_configure_creates_global_config(self) -> None:
+        with self.runner.isolated_filesystem():
+            global_config = Path("global-quadra.toml").resolve()
+
+            with patch.dict(os.environ, {"QUADRA_CONFIG": str(global_config)}):
+                result = self.runner.invoke(cli, ["configure"])
+
+            self.assertEqual(result.exit_code, 0, result.output)
+            self.assertIn(f"wrote global config: {global_config}", result.output)
+            config = global_config.read_text(encoding="utf-8")
+            self.assertIn("[runpod]", config)
+            self.assertIn('api_key_env = "RUNPOD_API_KEY"', config)
+            self.assertIn("[runpod.network_volume]", config)
+            self.assertIn('name = "quadra-dev"', config)
+            self.assertIn("size_gb = 50", config)
+            self.assertIn("[runpod.serverless]", config)
+            self.assertIn("workers_max = 1", config)
+            self.assertIn("[runpod.template]", config)
+            self.assertIn('name = "quadra-dev-serverless-worker"', config)
+
+    def test_configure_refuses_existing_global_config_without_force(self) -> None:
+        with self.runner.isolated_filesystem():
+            global_config = Path("global-quadra.toml").resolve()
+            global_config.write_text("# keep\n", encoding="utf-8")
+
+            with patch.dict(os.environ, {"QUADRA_CONFIG": str(global_config)}):
+                result = self.runner.invoke(cli, ["configure"])
+
+            self.assertNotEqual(result.exit_code, 0)
+            self.assertIn("already exists", result.output)
+            self.assertEqual(global_config.read_text(encoding="utf-8"), "# keep\n")
+
+    def test_configure_force_writes_custom_values(self) -> None:
+        with self.runner.isolated_filesystem():
+            global_config = Path("global-quadra.toml").resolve()
+            global_config.write_text("# old\n", encoding="utf-8")
+
+            result = self.runner.invoke(
+                cli,
+                [
+                    "configure",
+                    "--path",
+                    str(global_config),
+                    "--force",
+                    "--volume-name",
+                    "quadra-shared",
+                    "--endpoint-name",
+                    "quadra-shared",
+                    "--template-name",
+                    "quadra-shared-template",
+                    "--gpu-ids",
+                    "ADA_24",
+                    "--volume-size-gb",
+                    "80",
+                    "--timeout-seconds",
+                    "900",
+                    "--image-name",
+                    "custom/image:latest",
+                ],
+            )
+
+            self.assertEqual(result.exit_code, 0, result.output)
+            config = global_config.read_text(encoding="utf-8")
+            self.assertIn('name = "quadra-shared"', config)
+            self.assertIn('endpoint_name = "quadra-shared"', config)
+            self.assertIn('name = "quadra-shared-template"', config)
+            self.assertIn('gpu_ids = "ADA_24"', config)
+            self.assertIn("size_gb = 80", config)
+            self.assertIn("timeout_seconds = 900", config)
+            self.assertIn('image_name = "custom/image:latest"', config)
 
     def test_init_is_idempotent_and_recreates_missing_scaffold_files(self) -> None:
         with self.runner.isolated_filesystem():
@@ -1104,6 +1291,89 @@ class QuadraCLITestCase(unittest.TestCase):
                 result.output,
             )
 
+    def test_fork_clones_into_lib_and_wires_experiment_dependency(self) -> None:
+        with self.runner.isolated_filesystem():
+            self.assertEqual(self.runner.invoke(cli, ["init", "bonsai"]).exit_code, 0)
+
+            with chdir("bonsai"):
+                project_root = Path.cwd().resolve()
+                with patch("quadra.cli.subprocess.run") as run:
+                    result = self.runner.invoke(
+                        cli,
+                        ["fork", "https://github.com/acme/diffusers.git"],
+                    )
+
+                self.assertEqual(result.exit_code, 0, result.output)
+                run.assert_called_once_with(
+                    [
+                        "git",
+                        "clone",
+                        "https://github.com/acme/diffusers.git",
+                        str(project_root / "src" / "libs" / "diffusers"),
+                    ],
+                    cwd=str(project_root),
+                    check=True,
+                    text=True,
+                )
+                pyproject = Path("src/experiment/pyproject.toml").read_text(
+                    encoding="utf-8"
+                )
+
+            self.assertIn('dependencies = [\n    "diffusers",\n]', pyproject)
+            self.assertIn("[tool.uv.sources]", pyproject)
+            self.assertIn(
+                '"diffusers" = { path = "../libs/diffusers", editable = true }',
+                pyproject,
+            )
+            self.assertFalse(
+                (project_root / "src" / "libs" / "diffusers" / ".gitkeep").exists()
+            )
+            self.assertIn("package: diffusers", result.output)
+
+    def test_fork_accepts_package_name_when_repo_name_differs(self) -> None:
+        with self.runner.isolated_filesystem():
+            self.assertEqual(self.runner.invoke(cli, ["init", "bonsai"]).exit_code, 0)
+
+            with chdir("bonsai"):
+                with patch("quadra.cli.subprocess.run"):
+                    result = self.runner.invoke(
+                        cli,
+                        [
+                            "fork",
+                            "https://github.com/acme/diffusers-experiment.git",
+                            "--package",
+                            "diffusers",
+                        ],
+                    )
+                pyproject = Path("src/experiment/pyproject.toml").read_text(
+                    encoding="utf-8"
+                )
+
+            self.assertEqual(result.exit_code, 0, result.output)
+            self.assertIn('    "diffusers",', pyproject)
+            self.assertIn(
+                '"diffusers" = { path = "../libs/diffusers-experiment", editable = true }',
+                pyproject,
+            )
+
+    def test_fork_refuses_to_overwrite_existing_lib_checkout(self) -> None:
+        with self.runner.isolated_filesystem():
+            self.assertEqual(self.runner.invoke(cli, ["init", "bonsai"]).exit_code, 0)
+
+            with chdir("bonsai"):
+                lib_dir = Path("src/libs/custom-lib")
+                lib_dir.mkdir()
+                (lib_dir / "README.md").write_text("keep me\n", encoding="utf-8")
+                with patch("quadra.cli.subprocess.run") as run:
+                    result = self.runner.invoke(
+                        cli,
+                        ["fork", "https://github.com/acme/custom-lib.git"],
+                    )
+
+            self.assertNotEqual(result.exit_code, 0)
+            self.assertIn("already exists and is not empty", result.output)
+            run.assert_not_called()
+
     def test_sync_errors_when_volume_datacenter_has_no_s3_support(self) -> None:
         with self.runner.isolated_filesystem():
             self.assertEqual(self.runner.invoke(cli, ["init", "bonsai"]).exit_code, 0)
@@ -1141,6 +1411,10 @@ class QuadraCLITestCase(unittest.TestCase):
             )
             self.assertIn(
                 "projects/bonsai/.quadra/quadra_worker.py",
+                "\n".join(sorted(fake_s3.objects)),
+            )
+            self.assertIn(
+                ".quadra/quadra_worker.py",
                 "\n".join(sorted(fake_s3.objects)),
             )
 
@@ -1284,16 +1558,6 @@ class QuadraCLITestCase(unittest.TestCase):
                     count=1,
                     flags=re.MULTILINE,
                 )
-                if 'bench = "python main.py"' in config_text:
-                    config_text = config_text.replace(
-                        'bench = "python main.py"',
-                        'bench = "python scripts/bench.py"',
-                    )
-                elif 'main = "python main.py"' in config_text:
-                    config_text = config_text.replace(
-                        'main = "python main.py"',
-                        'bench = "python scripts/bench.py"\nmain = "python main.py"',
-                    )
                 config_path.write_text(config_text, encoding="utf-8")
 
                 with patch("quadra.cli.load_runpod_client", return_value=fake_client):
@@ -1308,7 +1572,7 @@ class QuadraCLITestCase(unittest.TestCase):
                 fake_client.created_templates[0]["docker_start_cmd"][2],
             )
             self.assertIn(
-                "/runpod-volume/projects/bonsai/.quadra/worker-runtime",
+                "/runpod-volume/.quadra/worker-runtime",
                 fake_client.created_templates[0]["docker_start_cmd"][2],
             )
             self.assertIn(
@@ -1628,7 +1892,7 @@ class QuadraCLITestCase(unittest.TestCase):
                             fake_client.created_templates[0]["docker_start_cmd"][2],
                         )
                         self.assertIn(
-                            "/runpod-volume/projects/bonsai/.quadra/worker-runtime",
+                            "/runpod-volume/.quadra/worker-runtime",
                             fake_client.created_templates[0]["docker_start_cmd"][2],
                         )
                         self.assertIn(
@@ -1684,6 +1948,98 @@ class QuadraCLITestCase(unittest.TestCase):
                             ),
                             "smoke artifact\n",
                         )
+
+    def test_run_executes_named_workflow_in_quadra_project(self) -> None:
+        with self.runner.isolated_filesystem():
+            init_result = self.runner.invoke(cli, ["init", "bonsai"])
+            self.assertEqual(init_result.exit_code, 0, init_result.output)
+            fake_s3 = FakeS3Client()
+            fake_client = FakeRunpodClient(fake_s3)
+
+            with chdir("bonsai"):
+                with patch("quadra.cli.load_runpod_client", return_value=fake_client):
+                    with patch("quadra.cli.build_s3_client", return_value=fake_s3):
+                        result = self.runner.invoke(cli, ["run", "smoke"])
+                reference = json.loads(
+                    Path(".quadra/last-run.json").read_text(encoding="utf-8")
+                )
+                artifact_path = (
+                    Path("runs")
+                    / reference["run_id"]
+                    / "artifacts"
+                    / "result.txt"
+                )
+
+                self.assertTrue(artifact_path.exists())
+
+            self.assertEqual(result.exit_code, 0, result.output)
+            self.assertIn("syncing bonsai -> /runpod-volume/projects/bonsai", result.output)
+            self.assertIn("submitting smoke", result.output)
+            self.assertIn("bonsai smoke remote", result.output)
+
+    def test_run_executes_plain_python_directory_with_global_config(self) -> None:
+        with self.runner.isolated_filesystem():
+            global_config = Path("global-quadra.toml").resolve()
+            global_config.write_text(
+                "\n".join(
+                    [
+                        "[runpod.network_volume]",
+                        'name = "quadra-dev"',
+                        "",
+                        "[runpod.serverless]",
+                        'endpoint_name = "quadra-dev"',
+                        "",
+                        "[runpod.template]",
+                        'name = "quadra-dev-serverless-worker"',
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            project_root = Path("gemlite")
+            project_root.mkdir()
+            (project_root / "pyproject.toml").write_text(
+                '[project]\nname = "gemlite"\nversion = "0.1.0"\n',
+                encoding="utf-8",
+            )
+            (project_root / "main.py").write_text("print('ok')\n", encoding="utf-8")
+            fake_s3 = FakeS3Client()
+            fake_client = FakeRunpodClient(fake_s3)
+            fake_client.volume["name"] = "quadra-dev"
+
+            with patch.dict(os.environ, {"QUADRA_CONFIG": str(global_config)}):
+                with chdir(project_root):
+                    with patch("quadra.cli.load_runpod_client", return_value=fake_client):
+                        with patch("quadra.cli.build_s3_client", return_value=fake_s3):
+                            result = self.runner.invoke(
+                                cli,
+                                ["run", "python main.py"],
+                            )
+                    reference = json.loads(
+                        Path(".quadra/last-run.json").read_text(encoding="utf-8")
+                    )
+                    artifact_path = (
+                        Path("runs")
+                        / reference["run_id"]
+                        / "artifacts"
+                        / "result.txt"
+                    )
+                    self.assertTrue(artifact_path.exists())
+
+            self.assertEqual(result.exit_code, 0, result.output)
+            self.assertIn("syncing gemlite -> /runpod-volume/projects/gemlite", result.output)
+            self.assertIn("submitting python main.py", result.output)
+            self.assertIn("projects/gemlite/pyproject.toml", fake_s3.objects)
+            self.assertIn(".quadra/quadra_worker.py", fake_s3.objects)
+            self.assertEqual(fake_client.created_endpoints[0]["name"], "quadra-dev")
+            self.assertEqual(
+                fake_client.submissions[0]["payload"]["quadra"]["command"],
+                "python main.py",
+            )
+            self.assertIn(
+                'cd "/runpod-volume/projects/gemlite" && "$(command -v uv)" sync',
+                fake_client.submissions[0]["payload"]["quadra"]["setup_command"],
+            )
 
     def test_smoke_reports_polling_progress(self) -> None:
         with self.runner.isolated_filesystem():

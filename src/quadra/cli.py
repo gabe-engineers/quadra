@@ -8,6 +8,7 @@ import os
 import posixpath
 import re
 import shutil
+import subprocess
 import sys
 import textwrap
 import time
@@ -27,6 +28,8 @@ from quadra.errors import QuadraError
 from quadra.runpod_rest import RunpodRestClient
 
 CONFIG_FILENAME = "quadra.toml"
+GLOBAL_CONFIG_ENV = "QUADRA_CONFIG"
+GLOBAL_CONFIG_PATH = Path("~/.config/quadra/config.toml")
 STATE_DIRNAME = ".quadra"
 LAST_RUN_FILENAME = "last-run.json"
 SYNC_MANIFEST_FILENAME = "sync-manifest.json"
@@ -36,12 +39,12 @@ SYNC_MANIFEST_VERSION = 1
 CONFIG_SCHEMA_VERSION = 3
 RUNPOD_VOLUME_ROOT = PurePosixPath("/runpod-volume")
 DEFAULT_TEMPLATE_VOLUME_MOUNT_PATH = str(RUNPOD_VOLUME_ROOT)
-DEFAULT_PROJECT_DIR = "/runpod-volume/projects/{project_name}"
+DEFAULT_PROJECT_DIR = "{volume_mount_path}/projects/{project_name}"
 FINAL_JOB_STATES = {"COMPLETED", "FAILED", "TIMED_OUT", "CANCELLED"}
 POLL_PROGRESS_INTERVAL_SECONDS = 10
 DEFAULT_RUNPOD_QUEUE_TIMEOUT_SECONDS = 300
 QUADRA_WORKER_FILENAME = "quadra_worker.py"
-DEFAULT_TEMPLATE_IMAGE = "pytorch/pytorch:2.12.1-cuda12.6-cudnn9-runtime"
+DEFAULT_TEMPLATE_IMAGE = "pytorch/pytorch:2.12.1-cuda13.2-cudnn9-runtime"
 DEFAULT_RUNPOD_ENDPOINT_API_BASE_URL = "https://api.runpod.ai/v2"
 DEFAULT_TEMPLATE_NAME = "quadra-{project_name}-serverless-worker"
 DEFAULT_TEMPLATE_BOOTSTRAP_COMMAND = textwrap.dedent(
@@ -269,7 +272,6 @@ DEFAULT_COMMANDS = {
     "main": DEFAULT_MAIN_COMMAND,
 }
 LEGACY_SMOKE_COMMAND = "python scripts/smoke.py"
-LEGACY_BENCH_COMMAND = "python scripts/bench.py"
 TERMINAL_WORKER_DESIRED_STATUSES = {"EXITED", "TERMINATED"}
 UNHEALTHY_WORKER_TEXT_HINTS = (
     "unhealthy",
@@ -353,6 +355,8 @@ class RunpodConfig:
     locations: str | None = None
     network_volume_id: str | None = None
     network_volume_name: str | None = None
+    network_volume_size_gb: int = DEFAULT_NETWORK_VOLUME_SIZE_GB
+    volume_mount_path: str = DEFAULT_TEMPLATE_VOLUME_MOUNT_PATH
     allowed_cuda_versions: tuple[str, ...] = ()
     timeout_seconds: int = 600
     s3_access_key_env: str | None = "AWS_ACCESS_KEY_ID"
@@ -382,6 +386,7 @@ class ProjectConfig:
     paths: ProjectPaths
     runtime: RuntimeConfig
     commands: dict[str, str] = field(default_factory=dict)
+    is_ephemeral: bool = False
 
     @property
     def quadra_dir(self) -> Path:
@@ -525,8 +530,6 @@ def normalize_managed_commands(commands: dict[str, str]) -> dict[str, str]:
         and normalized.get("main", DEFAULT_MAIN_COMMAND) == DEFAULT_MAIN_COMMAND
     ):
         normalized["smoke"] = DEFAULT_MAIN_COMMAND
-    if normalized.get("bench") == LEGACY_BENCH_COMMAND:
-        normalized.pop("bench", None)
     return normalized
 
 
@@ -771,6 +774,160 @@ def split_csv(value: str | None) -> tuple[str, ...]:
     return tuple(part.strip() for part in value.split(",") if part.strip())
 
 
+def global_config_path() -> Path:
+    configured = os.getenv(GLOBAL_CONFIG_ENV)
+    if configured:
+        return Path(configured).expanduser()
+    xdg_config_home = os.getenv("XDG_CONFIG_HOME")
+    if xdg_config_home:
+        return Path(xdg_config_home).expanduser() / "quadra" / "config.toml"
+    return GLOBAL_CONFIG_PATH.expanduser()
+
+
+def load_global_config() -> dict[str, Any]:
+    path = global_config_path()
+    if not path.exists():
+        return {}
+    try:
+        data = tomllib.loads(path.read_text(encoding="utf-8"))
+    except (OSError, tomllib.TOMLDecodeError) as exc:
+        raise QuadraError(f"Failed to read global config {path}: {exc}") from exc
+    if not isinstance(data, dict):
+        raise QuadraError(f"Global config {path} must contain TOML tables.")
+    return data
+
+
+def render_global_config(
+    *,
+    api_key_env: str,
+    data_center_id: str,
+    volume_name: str,
+    volume_size_gb: int,
+    volume_mount_path: str,
+    endpoint_name: str,
+    gpu_ids: str,
+    gpu_count: int,
+    workers_min: int,
+    workers_max: int,
+    idle_timeout: int,
+    scaler_type: str,
+    scaler_value: int,
+    flashboot: bool,
+    timeout_seconds: int,
+    template_name: str,
+    image_name: str,
+    container_disk_gb: int,
+) -> str:
+    return textwrap.dedent(
+        f"""\
+        [runpod]
+        api_key_env = {json.dumps(api_key_env)}
+        default_data_center_id = {json.dumps(data_center_id)}
+
+        [runpod.network_volume]
+        name = {json.dumps(volume_name)}
+        size_gb = {volume_size_gb}
+        mount_path = {json.dumps(volume_mount_path)}
+
+        [runpod.serverless]
+        endpoint_name = {json.dumps(endpoint_name)}
+        gpu_ids = {json.dumps(gpu_ids)}
+        gpu_count = {gpu_count}
+        workers_min = {workers_min}
+        workers_max = {workers_max}
+        idle_timeout = {idle_timeout}
+        scaler_type = {json.dumps(scaler_type)}
+        scaler_value = {scaler_value}
+        flashboot = {str(flashboot).lower()}
+        timeout_seconds = {timeout_seconds}
+
+        [runpod.template]
+        name = {json.dumps(template_name)}
+        image_name = {json.dumps(image_name)}
+        container_disk_gb = {container_disk_gb}
+        """
+    )
+
+
+def write_global_config(
+    path: Path,
+    *,
+    force: bool,
+    api_key_env: str,
+    data_center_id: str,
+    volume_name: str,
+    volume_size_gb: int,
+    volume_mount_path: str,
+    endpoint_name: str,
+    gpu_ids: str,
+    gpu_count: int,
+    workers_min: int,
+    workers_max: int,
+    idle_timeout: int,
+    scaler_type: str,
+    scaler_value: int,
+    flashboot: bool,
+    timeout_seconds: int,
+    template_name: str | None,
+    image_name: str,
+    container_disk_gb: int,
+) -> Path:
+    resolved_path = path.expanduser()
+    if resolved_path.exists() and not force:
+        raise QuadraError(
+            f"Global config already exists: {resolved_path}. Pass --force to overwrite it."
+        )
+    resolved_template_name = template_name or f"{endpoint_name}-serverless-worker"
+    text = render_global_config(
+        api_key_env=api_key_env,
+        data_center_id=data_center_id,
+        volume_name=volume_name,
+        volume_size_gb=volume_size_gb,
+        volume_mount_path=volume_mount_path,
+        endpoint_name=endpoint_name,
+        gpu_ids=gpu_ids,
+        gpu_count=gpu_count,
+        workers_min=workers_min,
+        workers_max=workers_max,
+        idle_timeout=idle_timeout,
+        scaler_type=scaler_type,
+        scaler_value=scaler_value,
+        flashboot=flashboot,
+        timeout_seconds=timeout_seconds,
+        template_name=resolved_template_name,
+        image_name=image_name,
+        container_disk_gb=container_disk_gb,
+    )
+    try:
+        resolved_path.parent.mkdir(parents=True, exist_ok=True)
+        resolved_path.write_text(text, encoding="utf-8")
+    except OSError as exc:
+        raise QuadraError(f"Failed to write global config {resolved_path}: {exc}") from exc
+    return resolved_path
+
+
+def optional_table(data: dict[str, Any], key: str, field_name: str) -> dict[str, Any]:
+    value = data.get(key)
+    if value is None:
+        return {}
+    if not isinstance(value, dict):
+        raise QuadraError(f"{field_name} must be a table.")
+    return value
+
+
+def merged_optional_str(
+    project_table: dict[str, Any],
+    global_table: dict[str, Any],
+    key: str,
+    default: str | None = None,
+) -> str | None:
+    return (
+        optional_str(project_table.get(key))
+        or optional_str(global_table.get(key))
+        or default
+    )
+
+
 def runpod_queue_timeout_seconds() -> int:
     raw_value = os.getenv("QUADRA_RUNPOD_QUEUE_TIMEOUT_SECONDS")
     if raw_value is None:
@@ -905,36 +1062,58 @@ def find_project_root(start: Path | None = None) -> Path:
     )
 
 
-def load_project(start: Path | None = None) -> ProjectConfig:
-    root = find_project_root(start)
-    config_path = root / CONFIG_FILENAME
-    try:
-        data = tomllib.loads(config_path.read_text(encoding="utf-8"))
-    except (OSError, tomllib.TOMLDecodeError) as exc:
-        raise QuadraError(f"Failed to read {config_path}: {exc}") from exc
-
+def build_project_config(
+    root: Path,
+    data: dict[str, Any],
+    *,
+    require_global_config: bool = False,
+    is_ephemeral: bool = False,
+) -> ProjectConfig:
     try:
         project = data["project"]
-        paths = data["paths"]
-        runtime = data["runtime"]
     except KeyError as exc:
         raise QuadraError(f"Missing required config section: {exc.args[0]}") from exc
 
-    runpod_data = runtime.get("runpod")
-    if not isinstance(runpod_data, dict):
-        raise QuadraError("Missing required config section: runtime.runpod")
-
+    paths = optional_table(data, "paths", "paths")
+    runtime = optional_table(data, "runtime", "runtime")
+    runpod_data = optional_table(runtime, "runpod", "runtime.runpod")
     project_name = str(project["name"])
-    project_dir = str(runtime["project_dir"])
-    template_data = runpod_data.get("template")
-    if template_data is None:
-        template_data = {}
-    if not isinstance(template_data, dict):
-        raise QuadraError("runtime.runpod.template must be a table.")
+
+    global_data = load_global_config()
+    if require_global_config and not global_data:
+        raise QuadraError(
+            "No Quadra project config was found and no global config is configured. "
+            "Run `quadra configure` first, or run `quadra init` in this project."
+        )
+    global_runpod = optional_table(global_data, "runpod", "runpod")
+    global_network_volume = optional_table(
+        global_runpod, "network_volume", "runpod.network_volume"
+    )
+    global_serverless = optional_table(
+        global_runpod, "serverless", "runpod.serverless"
+    )
+    global_template = optional_table(global_runpod, "template", "runpod.template")
+
+    volume_mount_path = (
+        optional_str(runpod_data.get("volume_mount_path"))
+        or optional_str(global_network_volume.get("mount_path"))
+        or DEFAULT_TEMPLATE_VOLUME_MOUNT_PATH
+    )
+    project_dir = str(
+        runtime.get("project_dir")
+        or DEFAULT_PROJECT_DIR.format(
+            volume_mount_path=volume_mount_path.rstrip("/"),
+            project_name=project_name,
+        )
+    )
+    template_data = optional_table(
+        runpod_data, "template", "runtime.runpod.template"
+    )
 
     docker_start_cmd = normalize_managed_docker_start_cmd(
         normalize_str_sequence(
             template_data.get("docker_start_cmd")
+            or global_template.get("docker_start_cmd")
             or list(DEFAULT_TEMPLATE_DOCKER_START_CMD),
             "runtime.runpod.template.docker_start_cmd",
         )
@@ -944,54 +1123,130 @@ def load_project(start: Path | None = None) -> ProjectConfig:
     )
 
     template_config = RunpodTemplateConfig(
-        id=optional_str(template_data.get("id")),
-        name=optional_str(template_data.get("name"))
-        or DEFAULT_TEMPLATE_NAME.format(project_name=project_name),
-        image_name=str(template_data.get("image_name", DEFAULT_TEMPLATE_IMAGE)).strip(),
+        id=optional_str(template_data.get("id")) or optional_str(global_template.get("id")),
+        name=(
+            optional_str(template_data.get("name"))
+            or optional_str(global_template.get("name"))
+            or DEFAULT_TEMPLATE_NAME.format(project_name=project_name)
+        ),
+        image_name=str(
+            template_data.get(
+                "image_name",
+                global_template.get("image_name", DEFAULT_TEMPLATE_IMAGE),
+            )
+        ).strip(),
         ports=normalize_str_sequence(
-            template_data.get("ports"), "runtime.runpod.template.ports"
+            template_data.get("ports", global_template.get("ports")),
+            "runtime.runpod.template.ports",
         ),
         docker_entrypoint=normalize_str_sequence(
-            template_data.get("docker_entrypoint"),
+            template_data.get(
+                "docker_entrypoint", global_template.get("docker_entrypoint")
+            ),
             "runtime.runpod.template.docker_entrypoint",
         ),
         docker_start_cmd=docker_start_cmd,
         env=normalize_string_map(
-            template_data.get("env"), "runtime.runpod.template.env"
+            template_data.get("env", global_template.get("env")),
+            "runtime.runpod.template.env",
         ),
-        container_disk_gb=int(template_data.get("container_disk_gb", 20)),
+        container_disk_gb=int(
+            template_data.get(
+                "container_disk_gb",
+                global_template.get("container_disk_gb", 20),
+            )
+        ),
         readme=str(
             template_data.get(
                 "readme",
-                "Managed by Quadra. Runs {worker_path} from the synced project volume.",
+                global_template.get(
+                    "readme",
+                    "Managed by Quadra. Runs {worker_path} from the synced project volume.",
+                ),
             )
         ),
     )
 
     runpod_config = RunpodConfig(
-        api_key_env=str(runpod_data.get("api_key_env", "RUNPOD_API_KEY")),
-        endpoint_id=optional_str(runpod_data.get("endpoint_id")),
-        endpoint_name=optional_str(runpod_data.get("endpoint_name")),
-        gpu_ids=str(runpod_data.get("gpu_ids", "AMPERE_16")).strip(),
-        gpu_count=int(runpod_data.get("gpu_count", 1)),
-        workers_min=int(runpod_data.get("workers_min", 0)),
-        workers_max=int(runpod_data.get("workers_max", 1)),
-        idle_timeout=int(runpod_data.get("idle_timeout", 5)),
-        scaler_type=str(runpod_data.get("scaler_type", "QUEUE_DELAY")).strip(),
-        scaler_value=int(runpod_data.get("scaler_value", 4)),
-        flashboot=bool(runpod_data.get("flashboot", False)),
-        locations=optional_str(runpod_data.get("locations")),
-        network_volume_id=optional_str(runpod_data.get("network_volume_id")),
-        network_volume_name=optional_str(runpod_data.get("network_volume_name")),
-        allowed_cuda_versions=normalize_allowed_cuda_versions(
-            runpod_data.get("allowed_cuda_versions")
+        api_key_env=(
+            merged_optional_str(runpod_data, global_runpod, "api_key_env")
+            or "RUNPOD_API_KEY"
         ),
-        timeout_seconds=int(runpod_data.get("timeout_seconds", 600)),
+        endpoint_id=merged_optional_str(
+            runpod_data, global_serverless, "endpoint_id"
+        ),
+        endpoint_name=merged_optional_str(
+            runpod_data, global_serverless, "endpoint_name"
+        ),
+        gpu_ids=str(
+            runpod_data.get(
+                "gpu_ids", global_serverless.get("gpu_ids", "AMPERE_16")
+            )
+        ).strip(),
+        gpu_count=int(
+            runpod_data.get("gpu_count", global_serverless.get("gpu_count", 1))
+        ),
+        workers_min=int(
+            runpod_data.get("workers_min", global_serverless.get("workers_min", 0))
+        ),
+        workers_max=int(
+            runpod_data.get("workers_max", global_serverless.get("workers_max", 1))
+        ),
+        idle_timeout=int(
+            runpod_data.get("idle_timeout", global_serverless.get("idle_timeout", 5))
+        ),
+        scaler_type=str(
+            runpod_data.get(
+                "scaler_type", global_serverless.get("scaler_type", "QUEUE_DELAY")
+            )
+        ).strip(),
+        scaler_value=int(
+            runpod_data.get("scaler_value", global_serverless.get("scaler_value", 4))
+        ),
+        flashboot=bool(
+            runpod_data.get("flashboot", global_serverless.get("flashboot", False))
+        ),
+        locations=(
+            optional_str(runpod_data.get("locations"))
+            or optional_str(global_serverless.get("locations"))
+            or optional_str(global_runpod.get("default_data_center_id"))
+        ),
+        network_volume_id=(
+            optional_str(runpod_data.get("network_volume_id"))
+            or optional_str(global_network_volume.get("id"))
+        ),
+        network_volume_name=(
+            optional_str(runpod_data.get("network_volume_name"))
+            or optional_str(global_network_volume.get("name"))
+        ),
+        network_volume_size_gb=int(
+            runpod_data.get(
+                "network_volume_size_gb",
+                global_network_volume.get("size_gb", DEFAULT_NETWORK_VOLUME_SIZE_GB),
+            )
+        ),
+        volume_mount_path=volume_mount_path,
+        allowed_cuda_versions=normalize_allowed_cuda_versions(
+            runpod_data.get(
+                "allowed_cuda_versions", global_serverless.get("allowed_cuda_versions")
+            )
+        ),
+        timeout_seconds=int(
+            runpod_data.get(
+                "timeout_seconds", global_serverless.get("timeout_seconds", 600)
+            )
+        ),
         s3_access_key_env=optional_str(
-            runpod_data.get("s3_access_key_env", "AWS_ACCESS_KEY_ID")
+            runpod_data.get(
+                "s3_access_key_env",
+                global_runpod.get("s3_access_key_env", "AWS_ACCESS_KEY_ID"),
+            )
         ),
         s3_secret_key_env=optional_str(
-            runpod_data.get("s3_secret_key_env", "AWS_SECRET_ACCESS_KEY")
+            runpod_data.get(
+                "s3_secret_key_env",
+                global_runpod.get("s3_secret_key_env", "AWS_SECRET_ACCESS_KEY"),
+            )
         ),
         template=template_config,
     )
@@ -1001,11 +1256,11 @@ def load_project(start: Path | None = None) -> ProjectConfig:
         name=str(project["name"]),
         root=root,
         paths=ProjectPaths(
-            libs=str(paths["libs"]),
-            experiment=str(paths["experiment"]),
-            models=str(paths["models"]),
-            caches=str(paths["caches"]),
-            runs=str(paths["runs"]),
+            libs=str(paths.get("libs", "src/libs")),
+            experiment=str(paths.get("experiment", "src/experiment")),
+            models=str(paths.get("models", "models")),
+            caches=str(paths.get("caches", "caches")),
+            runs=str(paths.get("runs", "runs")),
         ),
         runtime=RuntimeConfig(
             project_dir=project_dir,
@@ -1015,6 +1270,48 @@ def load_project(start: Path | None = None) -> ProjectConfig:
         commands=normalize_managed_commands(
             {str(key): str(value) for key, value in data.get("commands", {}).items()}
         ),
+        is_ephemeral=is_ephemeral,
+    )
+
+
+def load_project(start: Path | None = None) -> ProjectConfig:
+    root = find_project_root(start)
+    config_path = root / CONFIG_FILENAME
+    try:
+        data = tomllib.loads(config_path.read_text(encoding="utf-8"))
+    except (OSError, tomllib.TOMLDecodeError) as exc:
+        raise QuadraError(f"Failed to read {config_path}: {exc}") from exc
+
+    return build_project_config(root, data)
+
+
+def load_runnable_project(start: Path | None = None) -> ProjectConfig:
+    try:
+        return load_project(start)
+    except QuadraError as exc:
+        if f"Could not find {CONFIG_FILENAME}" not in str(exc):
+            raise
+
+    root = (start or Path.cwd()).resolve()
+    setup_command = DEFAULT_SETUP_COMMAND if (root / "pyproject.toml").exists() else None
+    data: dict[str, Any] = {
+        "schema_version": CONFIG_SCHEMA_VERSION,
+        "project": {"name": root.name},
+        "paths": {
+            "libs": "src/libs",
+            "experiment": ".",
+            "models": "models",
+            "caches": "caches",
+            "runs": "runs",
+        },
+        "runtime": {"setup_command": setup_command},
+        "commands": {},
+    }
+    return build_project_config(
+        root,
+        data,
+        require_global_config=True,
+        is_ephemeral=True,
     )
 
 
@@ -1030,7 +1327,10 @@ def init_project(target_root: Path, project_name: str) -> None:
         target_root / STATE_DIRNAME,
     ]
     scaffold_files = {
-        target_root / CONFIG_FILENAME: render_quadra_config(project_name),
+        target_root / CONFIG_FILENAME: render_quadra_config(
+            project_name,
+            use_global_backend=bool(load_global_config()),
+        ),
         target_root / QUADRA_WORKER_FILENAME: render_project_worker_py(),
         target_root / "src" / "experiment" / "pyproject.toml": render_experiment_pyproject(
             project_name
@@ -1072,8 +1372,32 @@ def init_project(target_root: Path, project_name: str) -> None:
         path.write_text(content, encoding="utf-8")
 
 
-def render_quadra_config(project_name: str) -> str:
-    project_dir = DEFAULT_PROJECT_DIR.format(project_name=project_name)
+def render_quadra_config(project_name: str, *, use_global_backend: bool = False) -> str:
+    if use_global_backend:
+        return textwrap.dedent(
+            f"""\
+            schema_version = {CONFIG_SCHEMA_VERSION}
+
+            [project]
+            name = "{project_name}"
+
+            [paths]
+            libs = "src/libs"
+            experiment = "src/experiment"
+            models = "models"
+            caches = "caches"
+            runs = "runs"
+
+            [commands]
+            smoke = "{DEFAULT_MAIN_COMMAND}"
+            main = "{DEFAULT_MAIN_COMMAND}"
+            """
+        )
+
+    project_dir = DEFAULT_PROJECT_DIR.format(
+        volume_mount_path=DEFAULT_TEMPLATE_VOLUME_MOUNT_PATH,
+        project_name=project_name,
+    )
     gpu_pool_comments = "\n        ".join(SERVERLESS_GPU_POOL_COMMENT_LINES)
     template_name = DEFAULT_TEMPLATE_NAME.format(project_name=project_name)
     setup_command = json.dumps(DEFAULT_SETUP_COMMAND)
@@ -1457,6 +1781,257 @@ def render_main_py(project_name: str) -> str:
     )
 
 
+def infer_repo_name_from_fork_url(fork_url: str) -> str:
+    candidate = fork_url.strip().rstrip("/")
+    if not candidate:
+        raise QuadraError("Fork URL cannot be empty.")
+    if candidate.endswith(".git"):
+        candidate = candidate[:-4]
+    repo_name = candidate.rsplit("/", 1)[-1]
+    if ":" in repo_name:
+        repo_name = repo_name.rsplit(":", 1)[-1]
+    if not re.fullmatch(r"[A-Za-z0-9._-]+", repo_name):
+        raise QuadraError(
+            f"Could not infer a safe library directory name from fork URL: {fork_url}"
+        )
+    return repo_name
+
+
+def validate_package_name(package_name: str) -> str:
+    normalized = package_name.strip()
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", normalized):
+        raise QuadraError(
+            "Package name must contain only letters, numbers, dots, underscores, and hyphens."
+        )
+    return normalized
+
+
+def pep508_dependency_name(requirement: str) -> str:
+    return re.split(r"\s*(?:\[|<|>|=|!|~|;|@)", requirement.strip(), maxsplit=1)[0]
+
+
+def package_dependency_exists(dependencies: object, package_name: str) -> bool:
+    if dependencies is None:
+        return False
+    if not isinstance(dependencies, list):
+        raise QuadraError(
+            "project.dependencies must be a list in experiment pyproject.toml."
+        )
+    expected = package_name.lower().replace("_", "-")
+    for dependency in dependencies:
+        if not isinstance(dependency, str):
+            raise QuadraError(
+                "project.dependencies must contain only strings in experiment pyproject.toml."
+            )
+        dependency_name = pep508_dependency_name(dependency).lower().replace("_", "-")
+        if dependency_name == expected:
+            return True
+    return False
+
+
+def find_toml_table_bounds(lines: list[str], table_name: str) -> tuple[int, int] | None:
+    table_header = f"[{table_name}]"
+    table_start: int | None = None
+    for index, line in enumerate(lines):
+        stripped = line.strip()
+        if not stripped.startswith("["):
+            continue
+        if stripped == table_header:
+            table_start = index
+            continue
+        if table_start is not None:
+            return table_start, index
+    if table_start is None:
+        return None
+    return table_start, len(lines)
+
+
+def format_dependency_lines(dependencies: list[str]) -> list[str]:
+    return ["dependencies = [\n"] + [
+        f"    {json.dumps(dependency)},\n" for dependency in dependencies
+    ] + ["]\n"]
+
+
+def ensure_project_dependency(
+    lines: list[str],
+    data: dict[str, Any],
+    package_name: str,
+) -> list[str]:
+    dependencies = data.get("project", {}).get("dependencies")
+    if package_dependency_exists(dependencies, package_name):
+        return lines
+
+    project_bounds = find_toml_table_bounds(lines, "project")
+    if project_bounds is None:
+        raise QuadraError("Missing [project] table in experiment pyproject.toml.")
+    project_start, project_end = project_bounds
+    dependency_lines = format_dependency_lines([package_name])
+
+    if dependencies is None:
+        insert_at = project_end
+        for index in range(project_start + 1, project_end):
+            if lines[index].strip().startswith("requires-python"):
+                insert_at = index + 1
+                break
+        return lines[:insert_at] + dependency_lines + lines[insert_at:]
+
+    if not isinstance(dependencies, list):
+        raise QuadraError(
+            "project.dependencies must be a list in experiment pyproject.toml."
+        )
+
+    updated_dependencies = [
+        str(dependency) for dependency in dependencies
+    ] + [package_name]
+    for index in range(project_start + 1, project_end):
+        if not re.match(r"\s*dependencies\s*=", lines[index]):
+            continue
+
+        if "[" in lines[index] and "]" in lines[index]:
+            return (
+                lines[:index]
+                + format_dependency_lines(updated_dependencies)
+                + lines[index + 1 :]
+            )
+
+        dependency_end = index + 1
+        while dependency_end < project_end:
+            if "]" in lines[dependency_end]:
+                break
+            dependency_end += 1
+        if dependency_end >= project_end:
+            raise QuadraError(
+                "Could not parse project.dependencies in experiment pyproject.toml."
+            )
+        return (
+            lines[:index]
+            + format_dependency_lines(updated_dependencies)
+            + lines[dependency_end + 1 :]
+        )
+
+    raise QuadraError(
+        "Could not locate project.dependencies in experiment pyproject.toml."
+    )
+
+
+def toml_quoted_key(key: str) -> str:
+    return json.dumps(key)
+
+
+def format_uv_source_line(package_name: str, source_path: str) -> str:
+    return (
+        f"{toml_quoted_key(package_name)} = "
+        f"{{ path = {json.dumps(source_path)}, editable = true }}\n"
+    )
+
+
+def ensure_uv_path_source(
+    lines: list[str],
+    package_name: str,
+    source_path: str,
+) -> list[str]:
+    source_line = format_uv_source_line(package_name, source_path)
+    sources_bounds = find_toml_table_bounds(lines, "tool.uv.sources")
+    if sources_bounds is None:
+        prefix = ["\n"] if lines and lines[-1].strip() else []
+        return lines + prefix + ["[tool.uv.sources]\n", source_line]
+
+    sources_start, sources_end = sources_bounds
+    quoted_key_pattern = re.escape(toml_quoted_key(package_name))
+    bare_key_pattern = re.escape(package_name)
+    key_pattern = rf"\s*(?:{quoted_key_pattern}|{bare_key_pattern})\s*="
+    for index in range(sources_start + 1, sources_end):
+        if re.match(key_pattern, lines[index]):
+            return lines[:index] + [source_line] + lines[index + 1 :]
+    return lines[:sources_end] + [source_line] + lines[sources_end:]
+
+
+def wire_experiment_to_local_fork(
+    config: ProjectConfig,
+    *,
+    package_name: str,
+    lib_dir: Path,
+) -> Path:
+    experiment_dir = config.root / config.paths.experiment
+    pyproject_path = experiment_dir / "pyproject.toml"
+    if not pyproject_path.exists():
+        raise QuadraError(f"Experiment pyproject.toml not found: {pyproject_path}")
+
+    try:
+        text = pyproject_path.read_text(encoding="utf-8")
+        data = tomllib.loads(text)
+    except (OSError, tomllib.TOMLDecodeError) as exc:
+        raise QuadraError(f"Failed to read {pyproject_path}: {exc}") from exc
+
+    source_path = os.path.relpath(lib_dir, experiment_dir).replace(os.sep, "/")
+    lines = text.splitlines(keepends=True)
+    lines = ensure_project_dependency(lines, data, package_name)
+    lines = ensure_uv_path_source(lines, package_name, source_path)
+    pyproject_path.write_text("".join(lines), encoding="utf-8")
+    return pyproject_path
+
+
+def prepare_library_destination(config: ProjectConfig, repo_name: str) -> Path:
+    libs_dir = config.root / config.paths.libs
+    destination = libs_dir / repo_name
+    if destination.exists() and not destination.is_dir():
+        raise QuadraError(f"Refusing to overwrite existing path: {destination}")
+    if destination.exists():
+        children = list(destination.iterdir())
+        if (
+            len(children) == 1
+            and children[0].name == ".gitkeep"
+            and children[0].is_file()
+        ):
+            children[0].unlink()
+            children = []
+        if children:
+            raise QuadraError(
+                f"Library destination already exists and is not empty: {destination}"
+            )
+    else:
+        destination.parent.mkdir(parents=True, exist_ok=True)
+    return destination
+
+
+def clone_fork_into_project(
+    config: ProjectConfig,
+    *,
+    fork_url: str,
+    package_name: str | None = None,
+) -> tuple[Path, Path, str]:
+    repo_name = infer_repo_name_from_fork_url(fork_url)
+    resolved_package_name = validate_package_name(package_name or repo_name)
+    destination = prepare_library_destination(config, repo_name)
+
+    experiment_pyproject = config.root / config.paths.experiment / "pyproject.toml"
+    if not experiment_pyproject.exists():
+        raise QuadraError(f"Experiment pyproject.toml not found: {experiment_pyproject}")
+    try:
+        tomllib.loads(experiment_pyproject.read_text(encoding="utf-8"))
+    except (OSError, tomllib.TOMLDecodeError) as exc:
+        raise QuadraError(f"Failed to read {experiment_pyproject}: {exc}") from exc
+
+    try:
+        subprocess.run(
+            ["git", "clone", fork_url, str(destination)],
+            cwd=str(config.root),
+            check=True,
+            text=True,
+        )
+    except FileNotFoundError as exc:
+        raise QuadraError("git is required to clone fork URLs.") from exc
+    except subprocess.CalledProcessError as exc:
+        raise QuadraError(f"Failed to clone fork URL into {destination}.") from exc
+
+    pyproject_path = wire_experiment_to_local_fork(
+        config,
+        package_name=resolved_package_name,
+        lib_dir=destination,
+    )
+    return destination, pyproject_path, resolved_package_name
+
+
 def load_runpod_client(config: ProjectConfig) -> Any:
     api_key = os.getenv(config.runtime.runpod.api_key_env)
     if not api_key:
@@ -1471,8 +2046,16 @@ def runpod_endpoint_name(config: ProjectConfig) -> str:
     return config.runtime.runpod.endpoint_name or f"quadra-{config.name}"
 
 
+def remote_volume_state_path(config: ProjectConfig, filename: str) -> str:
+    return str(
+        PurePosixPath(config.runtime.runpod.volume_mount_path)
+        / STATE_DIRNAME
+        / filename
+    )
+
+
 def remote_worker_path(config: ProjectConfig) -> str:
-    return str(PurePosixPath(config.runtime.project_dir) / STATE_DIRNAME / QUADRA_WORKER_FILENAME)
+    return remote_volume_state_path(config, QUADRA_WORKER_FILENAME)
 
 
 def remote_worker_bootstrap_log_path(config: ProjectConfig) -> str:
@@ -1484,16 +2067,41 @@ def remote_worker_bootstrap_log_path(config: ProjectConfig) -> str:
 
 
 def remote_worker_runtime_path(config: ProjectConfig) -> str:
-    return str(PurePosixPath(config.runtime.project_dir) / STATE_DIRNAME / "worker-runtime")
+    return remote_volume_state_path(config, "worker-runtime")
+
+
+def managed_worker_source() -> bytes:
+    return importlib.resources.files("quadra").joinpath(
+        "serverless_worker.py"
+    ).read_text(encoding="utf-8").encode("utf-8")
 
 
 def managed_sync_files() -> dict[str, bytes]:
-    worker_source = importlib.resources.files("quadra").joinpath(
-        "serverless_worker.py"
-    ).read_text(encoding="utf-8")
+    worker_source = managed_worker_source()
     return {
-        f"{STATE_DIRNAME}/{QUADRA_WORKER_FILENAME}": worker_source.encode("utf-8"),
+        f"{STATE_DIRNAME}/{QUADRA_WORKER_FILENAME}": worker_source,
     }
+
+
+def sync_global_worker(s3: Any, bucket: str, config: ProjectConfig) -> None:
+    worker_key = remote_global_state_key(QUADRA_WORKER_FILENAME)
+    worker_source = managed_worker_source()
+    try:
+        response = s3.get_object(Bucket=bucket, Key=worker_key)
+        if response["Body"].read() == worker_source:
+            return
+    except Exception:
+        pass
+
+    try:
+        s3.put_object(
+            Bucket=bucket,
+            Key=worker_key,
+            Body=worker_source,
+            ContentType="text/x-python",
+        )
+    except Exception as exc:
+        raise QuadraError("Failed to sync global Quadra worker to volume.") from exc
 
 
 def remote_experiment_dir(config: ProjectConfig) -> str:
@@ -1511,7 +2119,7 @@ def expand_template_tokens(value: str, config: ProjectConfig) -> str:
             remote_worker_bootstrap_log_path(config),
         )
         .replace("{worker_runtime_path}", remote_worker_runtime_path(config))
-        .replace("{runpod_volume_root}", str(RUNPOD_VOLUME_ROOT))
+        .replace("{runpod_volume_root}", config.runtime.runpod.volume_mount_path)
     )
 
 
@@ -1520,7 +2128,7 @@ def expand_runtime_tokens(value: str, config: ProjectConfig) -> str:
         value.replace("{project_name}", config.name)
         .replace("{project_dir}", config.runtime.project_dir)
         .replace("{experiment_dir}", remote_experiment_dir(config))
-        .replace("{runpod_volume_root}", str(RUNPOD_VOLUME_ROOT))
+        .replace("{runpod_volume_root}", config.runtime.runpod.volume_mount_path)
     )
 
 
@@ -1536,7 +2144,7 @@ def build_template_spec(config: ProjectConfig) -> TemplateSpec:
         docker_start_cmd=tuple(
             expand_template_tokens(item, config) for item in template.docker_start_cmd
         ),
-        volume_mount_path=DEFAULT_TEMPLATE_VOLUME_MOUNT_PATH,
+        volume_mount_path=config.runtime.runpod.volume_mount_path,
         env={
             key: expand_template_tokens(value, config)
             for key, value in template.env.items()
@@ -1602,15 +2210,19 @@ def prompt_resolve_missing_runpod_volume(
                 name=optional_str(selected.get("name")) or target_name,
                 data_center_id=optional_str(selected.get("dataCenterId")),
             )
-            persist_network_volume_link(config, linked_volume)
+            if not config.is_ephemeral:
+                persist_network_volume_link(config, linked_volume)
             remember_selected_network_volume(config, linked_volume)
             click.echo(
                 f"linked {config.name} to RunPod network volume {linked_volume.id} "
                 f"({linked_volume.name!r}, {linked_volume.data_center_id or 'unknown-dc'})"
             )
-            click.echo(
-                f"updated runtime.runpod.network_volume_id in {config.root / CONFIG_FILENAME}"
-            )
+            if config.is_ephemeral:
+                click.echo("using linked volume for this command")
+            else:
+                click.echo(
+                    f"updated runtime.runpod.network_volume_id in {config.root / CONFIG_FILENAME}"
+                )
             return linked_volume
     elif volumes:
         click.echo(
@@ -1658,7 +2270,7 @@ def prompt_resolve_missing_runpod_volume(
     size_gb = click.prompt(
         "Network volume size in GB",
         type=click.IntRange(min=1),
-        default=DEFAULT_NETWORK_VOLUME_SIZE_GB,
+        default=config.runtime.runpod.network_volume_size_gb,
         show_default=True,
     )
     volume = client.create_network_volume(
@@ -1903,11 +2515,12 @@ def ensure_volume_supports_s3(volume: VolumeHandle) -> str:
 
 def remote_project_key(config: ProjectConfig) -> str:
     project_dir = PurePosixPath(config.runtime.project_dir)
+    volume_mount_path = PurePosixPath(config.runtime.runpod.volume_mount_path)
     try:
-        relative = project_dir.relative_to(RUNPOD_VOLUME_ROOT)
+        relative = project_dir.relative_to(volume_mount_path)
     except ValueError as exc:
         raise QuadraError(
-            "runtime.project_dir must live under /runpod-volume for RunPod Serverless."
+            f"runtime.project_dir must live under {volume_mount_path} for RunPod Serverless."
         ) from exc
     return relative.as_posix()
 
@@ -1932,6 +2545,10 @@ def remote_state_file_key(config: ProjectConfig, filename: str) -> str:
 
 def remote_sync_manifest_key(config: ProjectConfig) -> str:
     return remote_state_file_key(config, SYNC_MANIFEST_FILENAME)
+
+
+def remote_global_state_key(filename: str) -> str:
+    return posixpath.join(STATE_DIRNAME, filename)
 
 
 def build_s3_client(config: ProjectConfig, volume: VolumeHandle) -> Any:
@@ -2161,6 +2778,7 @@ def sync_project(config: ProjectConfig) -> tuple[VolumeHandle, int, int]:
         f"({volume.data_center_id or 'unknown-dc'})..."
     )
     s3 = build_s3_client(config, volume)
+    sync_global_worker(s3, volume.id, config)
 
     prefix = remote_project_key(config)
     report_step("scanning local project files...")
@@ -2221,8 +2839,13 @@ def ensure_project_synced(config: ProjectConfig, volume: VolumeHandle) -> None:
         f"({volume.data_center_id or 'unknown-dc'})..."
     )
     s3 = build_s3_client(config, volume)
+    sync_global_worker(s3, volume.id, config)
     report_step("checking remote project sync state...")
-    key = posixpath.join(remote_project_key(config), CONFIG_FILENAME)
+    key = (
+        remote_sync_manifest_key(config)
+        if config.is_ephemeral
+        else posixpath.join(remote_project_key(config), CONFIG_FILENAME)
+    )
     try:
         s3.head_object(Bucket=volume.id, Key=key)
     except Exception as exc:
@@ -2897,15 +3520,16 @@ def pull_run(
     return destination
 
 
-def run_named_workflow(config: ProjectConfig, workflow: str) -> int:
+def run_command(config: ProjectConfig, command_parts: tuple[str, ...]) -> int:
     click.echo(f"syncing {config.name} -> {config.runtime.project_dir}")
     volume, uploaded, deleted = sync_project(config)
     click.echo(
         f"volume: {volume.id} ({volume.data_center_id or 'unknown-dc'}), "
         f"uploaded: {uploaded}, deleted: {deleted}"
     )
+    _command, workflow = resolve_run_command(config, command_parts, config.root)
     click.echo(f"submitting {workflow}")
-    reference, endpoint = submit_workflow(config, (workflow,))
+    reference, endpoint = submit_workflow(config, command_parts)
     click.echo(f"run_id: {reference.run_id}")
     click.echo(f"job_id: {reference.job_id}")
     click.echo(f"endpoint_id: {endpoint.id}")
@@ -2914,6 +3538,10 @@ def run_named_workflow(config: ProjectConfig, workflow: str) -> int:
     click.echo(f"pulling artifacts for {reference.run_id}")
     pull_run(config, run_id=reference.run_id)
     return 0 if status == "COMPLETED" else 1
+
+
+def run_named_workflow(config: ProjectConfig, workflow: str) -> int:
+    return run_command(config, (workflow,))
 
 
 @click.group(cls=BannerGroup, context_settings={"help_option_names": ["-h", "--help"]})
@@ -2945,6 +3573,107 @@ def init(project_name: str | None) -> None:
 
 
 @cli.command()
+@click.option(
+    "--path",
+    "config_path",
+    type=click.Path(path_type=Path, dir_okay=False, writable=True),
+    help="Global config path. Defaults to QUADRA_CONFIG or ~/.config/quadra/config.toml.",
+)
+@click.option("--force", is_flag=True, help="Overwrite an existing global config.")
+@click.option("--api-key-env", default="RUNPOD_API_KEY", show_default=True)
+@click.option("--data-center", default="US-IL-1", show_default=True)
+@click.option("--volume-name", default="quadra-dev", show_default=True)
+@click.option(
+    "--volume-size-gb",
+    default=DEFAULT_NETWORK_VOLUME_SIZE_GB,
+    show_default=True,
+    type=click.IntRange(min=1),
+)
+@click.option(
+    "--volume-mount-path",
+    default=DEFAULT_TEMPLATE_VOLUME_MOUNT_PATH,
+    show_default=True,
+)
+@click.option("--endpoint-name", default="quadra-dev", show_default=True)
+@click.option("--gpu-ids", default="AMPERE_16", show_default=True)
+@click.option("--gpu-count", default=1, show_default=True, type=click.IntRange(min=1))
+@click.option("--workers-min", default=0, show_default=True, type=click.IntRange(min=0))
+@click.option("--workers-max", default=1, show_default=True, type=click.IntRange(min=1))
+@click.option("--idle-timeout", default=5, show_default=True, type=click.IntRange(min=0))
+@click.option("--scaler-type", default="QUEUE_DELAY", show_default=True)
+@click.option("--scaler-value", default=4, show_default=True, type=click.IntRange(min=0))
+@click.option("--flashboot/--no-flashboot", default=False, show_default=True)
+@click.option(
+    "--timeout-seconds",
+    default=600,
+    show_default=True,
+    type=click.IntRange(min=1),
+)
+@click.option(
+    "--template-name",
+    default=None,
+    help="RunPod template name. Defaults to '<endpoint-name>-serverless-worker'.",
+)
+@click.option("--image-name", default=DEFAULT_TEMPLATE_IMAGE, show_default=True)
+@click.option(
+    "--container-disk-gb",
+    default=20,
+    show_default=True,
+    type=click.IntRange(min=1),
+)
+def configure(
+    config_path: Path | None,
+    force: bool,
+    api_key_env: str,
+    data_center: str,
+    volume_name: str,
+    volume_size_gb: int,
+    volume_mount_path: str,
+    endpoint_name: str,
+    gpu_ids: str,
+    gpu_count: int,
+    workers_min: int,
+    workers_max: int,
+    idle_timeout: int,
+    scaler_type: str,
+    scaler_value: int,
+    flashboot: bool,
+    timeout_seconds: int,
+    template_name: str | None,
+    image_name: str,
+    container_disk_gb: int,
+) -> None:
+    """Create Quadra's machine-level RunPod backend config."""
+    try:
+        path = write_global_config(
+            config_path or global_config_path(),
+            force=force,
+            api_key_env=api_key_env,
+            data_center_id=data_center,
+            volume_name=volume_name,
+            volume_size_gb=volume_size_gb,
+            volume_mount_path=volume_mount_path,
+            endpoint_name=endpoint_name,
+            gpu_ids=gpu_ids,
+            gpu_count=gpu_count,
+            workers_min=workers_min,
+            workers_max=workers_max,
+            idle_timeout=idle_timeout,
+            scaler_type=scaler_type,
+            scaler_value=scaler_value,
+            flashboot=flashboot,
+            timeout_seconds=timeout_seconds,
+            template_name=template_name,
+            image_name=image_name,
+            container_disk_gb=container_disk_gb,
+        )
+    except QuadraError as exc:
+        raise click.ClickException(str(exc)) from exc
+
+    click.echo(f"wrote global config: {path}")
+
+
+@cli.command()
 def sync() -> None:
     """Sync the project into the RunPod network volume over S3."""
     try:
@@ -2965,7 +3694,7 @@ def sync() -> None:
 def submit(command_parts: tuple[str, ...]) -> None:
     """Submit a workflow to the configured RunPod Serverless endpoint."""
     try:
-        config = load_project()
+        config = load_runnable_project()
         reference, endpoint = submit_workflow(config, command_parts)
     except QuadraError as exc:
         raise click.ClickException(str(exc)) from exc
@@ -2980,6 +3709,45 @@ def submit(command_parts: tuple[str, ...]) -> None:
     click.echo("quadra pull")
 
 
+@cli.command(context_settings={"ignore_unknown_options": True})
+@click.argument("command_parts", nargs=-1, required=True, type=click.UNPROCESSED)
+def run(command_parts: tuple[str, ...]) -> None:
+    """Sync, run a command remotely, stream logs, and pull artifacts."""
+    try:
+        config = load_runnable_project()
+        code = run_command(config, command_parts)
+    except QuadraError as exc:
+        raise click.ClickException(str(exc)) from exc
+
+    if code != 0:
+        raise click.exceptions.Exit(code)
+
+
+@cli.command()
+@click.argument("fork_url")
+@click.option(
+    "--package",
+    "package_name",
+    help="Python package name to depend on when it differs from the fork repo name.",
+)
+def fork(fork_url: str, package_name: str | None) -> None:
+    """Clone a fork into src/libs and use it from the experiment project."""
+    try:
+        config = load_project()
+        destination, pyproject_path, resolved_package_name = clone_fork_into_project(
+            config,
+            fork_url=fork_url,
+            package_name=package_name,
+        )
+    except QuadraError as exc:
+        raise click.ClickException(str(exc)) from exc
+
+    click.echo(f"cloned {fork_url}")
+    click.echo(f"library: {destination}")
+    click.echo(f"package: {resolved_package_name}")
+    click.echo(f"updated: {pyproject_path}")
+
+
 @cli.command()
 @click.option(
     "--follow/--no-follow", default=True, help="Poll until the job completes."
@@ -2987,7 +3755,7 @@ def submit(command_parts: tuple[str, ...]) -> None:
 def logs(follow: bool) -> None:
     """Stream logs for the most recently submitted run."""
     try:
-        config = load_project()
+        config = load_runnable_project()
         reference = load_last_run(config)
         status = stream_logs(config, reference, follow=follow)
     except QuadraError as exc:
@@ -3004,7 +3772,7 @@ def logs(follow: bool) -> None:
 def pull(run_id: str | None, destination: str | None) -> None:
     """Download a completed run directory from the RunPod volume."""
     try:
-        config = load_project()
+        config = load_runnable_project()
         resolved_run_id = run_id or load_last_run(config).run_id
         destination_root = Path(destination).resolve() if destination else None
         pulled_to = pull_run(
@@ -3021,7 +3789,7 @@ def pull(run_id: str | None, destination: str | None) -> None:
 def smoke() -> None:
     """Sync, submit, stream logs, and pull artifacts for the smoke workflow."""
     try:
-        config = load_project()
+        config = load_runnable_project()
         code = run_named_workflow(config, "smoke")
     except QuadraError as exc:
         raise click.ClickException(str(exc)) from exc

@@ -22,6 +22,11 @@ def _append_bootstrap_log(message: str) -> None:
         handle.write(f"[runpod worker] {_now()} {message}\n")
 
 
+def _use_project_bootstrap_log(project_dir: Path) -> None:
+    global WORKER_BOOTSTRAP_LOG_PATH
+    WORKER_BOOTSTRAP_LOG_PATH = project_dir / ".quadra" / "worker-bootstrap.log"
+
+
 def _write_status(path: Path, payload: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
@@ -91,7 +96,6 @@ def _run_shell(
 def handler(job: dict[str, Any]) -> dict[str, Any]:
     payload = (job or {}).get("input") or {}
     spec = payload.get("quadra") if isinstance(payload.get("quadra"), dict) else payload
-    _append_bootstrap_log("handler invoked")
 
     required = ["project_name", "run_id", "project_dir", "experiment_dir", "run_dir", "command"]
     missing = [key for key in required if not spec.get(key)]
@@ -102,6 +106,8 @@ def handler(job: dict[str, Any]) -> dict[str, Any]:
     run_id = str(spec["run_id"])
     workflow = str(spec.get("workflow", spec["command"]))
     project_dir = Path(str(spec["project_dir"]))
+    _use_project_bootstrap_log(project_dir)
+    _append_bootstrap_log("handler invoked")
     experiment_dir = Path(str(spec["experiment_dir"]))
     run_dir = Path(str(spec["run_dir"]))
     artifacts_dir = Path(str(spec.get("artifacts_dir", run_dir / "artifacts")))

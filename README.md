@@ -17,18 +17,24 @@
 ## Quick Start
 
 ```bash
+quadra configure
 quadra init bonsai
 cd bonsai
-quadra sync
-quadra submit smoke
-quadra logs
-quadra pull
+quadra run smoke
 ```
 
 For the built-in workflow shortcuts:
 
 ```bash
 quadra smoke
+```
+
+For an ordinary Python project that has no `quadra.toml`, configure the machine
+backend once and run a command directly:
+
+```bash
+cd ../gemlite
+quadra run "python main.py"
 ```
 
 If you are already inside the target directory, `quadra init` also works without a
@@ -42,13 +48,22 @@ quadra init
 
 ## Core Commands
 
+- `quadra configure` creates the machine-level RunPod backend config at
+  `~/.config/quadra/config.toml`, or at `QUADRA_CONFIG` when that environment
+  variable is set. It refuses to overwrite an existing file unless `--force` is passed.
 - `quadra init [project_name]` scaffolds a Quadra project in a new or current directory.
   Re-running it is safe: missing scaffold files are recreated and existing files are preserved.
 - `quadra sync` pushes the local project into the configured RunPod network volume.
   If the configured volume does not exist yet, Quadra can offer to create one or
   link the project to an existing compatible volume interactively.
   Sync keeps a small remote manifest under `.quadra/` and only re-uploads files whose contents changed.
+- `quadra run <command>` syncs the current directory, submits the command, streams
+  logs, and pulls artifacts. In a directory without `quadra.toml`, Quadra uses the
+  machine config and treats the current directory as the experiment root.
 - `quadra submit <workflow>` submits a workflow job to the configured Serverless endpoint.
+- `quadra fork <fork_url>` clones a fork into `src/libs/<repo>/` and updates
+  `src/experiment/pyproject.toml` to use that local checkout as an editable uv source.
+  Pass `--package <name>` when the Python package name differs from the fork repo name.
 - `quadra logs` streams logs for the most recently submitted run.
 - `quadra pull [run_id] [destination]` downloads a completed run into `runs/<run_id>/`.
 - `quadra smoke` runs the full sync-submit-logs-pull loop for the default workflow.
@@ -69,12 +84,48 @@ Quadra targets RunPod Serverless only.
 
 Your network volume must live in a RunPod datacenter that supports the S3-compatible API. Quadra checks this up front and fails early when the selected volume cannot be used for sync and artifact pull.
 
+## Machine Config
+
+Quadra reads machine-level RunPod defaults from `~/.config/quadra/config.toml`.
+Set `QUADRA_CONFIG=/path/to/config.toml` to use a different file.
+
+Project `quadra.toml` values override machine config values. Machine config is
+intended for the shared RunPod backend:
+
+```toml
+[runpod]
+api_key_env = "RUNPOD_API_KEY"
+default_data_center_id = "US-IL-1"
+
+[runpod.network_volume]
+name = "quadra-dev"
+size_gb = 50
+mount_path = "/runpod-volume"
+
+[runpod.serverless]
+endpoint_name = "quadra-dev"
+gpu_ids = "AMPERE_16"
+gpu_count = 1
+workers_min = 0
+workers_max = 1
+idle_timeout = 5
+scaler_type = "QUEUE_DELAY"
+scaler_value = 4
+flashboot = false
+timeout_seconds = 600
+
+[runpod.template]
+name = "quadra-dev-serverless-worker"
+image_name = "pytorch/pytorch:2.12.1-cuda13.2-cudnn9-runtime"
+container_disk_gb = 20
+```
+
 ## Worker Contract
 
 By default, Quadra creates a serverless template that starts:
 
 ```bash
-python -u /runpod-volume/projects/<project_name>/quadra_worker.py
+python -u /runpod-volume/.quadra/quadra_worker.py
 ```
 
 That worker script can be replaced by editing `[runtime.runpod.template]` in `quadra.toml`.
@@ -85,7 +136,7 @@ The default worker configures the serverless template to mount the RunPod networ
 /runpod-volume/projects/<project_name>/runs/<run_id>/
 ```
 
-The scaffolded default uses a public CUDA-enabled `pytorch/pytorch` runtime image, bootstraps the `runpod` worker package into an isolated runtime under `/runpod-volume/projects/<project_name>/.quadra/worker-runtime`, writes worker startup traces to `/runpod-volume/projects/<project_name>/.quadra/worker-bootstrap.log`, and uses a `setup_command` that bootstraps `uv` into an isolated runtime under `/runpod-volume/projects/<project_name>/.quadra/uv-runtime` only when the image does not already provide it.
+The scaffolded default uses a public CUDA-enabled `pytorch/pytorch` runtime image, bootstraps the `runpod` worker package into an isolated runtime under `/runpod-volume/.quadra/worker-runtime`, writes per-project worker startup traces to `/runpod-volume/projects/<project_name>/.quadra/worker-bootstrap.log`, and uses a `setup_command` that bootstraps `uv` into an isolated runtime under `/runpod-volume/projects/<project_name>/.quadra/uv-runtime` only when the image does not already provide it.
 
 `timeout_seconds` in `runtime.runpod` is applied to the endpoint execution timeout when Quadra creates the endpoint.
 
