@@ -1,0 +1,2 @@
+[console_scripts]
+quadra = quadra.cli:cli

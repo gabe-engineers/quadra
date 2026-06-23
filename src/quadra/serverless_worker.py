@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import json
 import os
+import select
 import subprocess
+import sys
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, Generator
 
 
 WORKER_BOOTSTRAP_LOG_PATH = Path(__file__).resolve().parent / ".quadra" / "worker-bootstrap.log"
@@ -18,8 +20,11 @@ def _now() -> str:
 
 def _append_bootstrap_log(message: str) -> None:
     WORKER_BOOTSTRAP_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+    line = f"[runpod worker] {_now()} {message}\n"
     with WORKER_BOOTSTRAP_LOG_PATH.open("a", encoding="utf-8") as handle:
-        handle.write(f"[runpod worker] {_now()} {message}\n")
+        handle.write(line)
+    sys.stdout.write(line)
+    sys.stdout.flush()
 
 
 def _use_project_bootstrap_log(project_dir: Path) -> None:
@@ -70,30 +75,96 @@ def _persist_run_state(
     )
 
 
-def _run_shell(
+def _run_streaming(
     command: str,
     *,
     cwd: Path,
     env: dict[str, str],
     stdout_path: Path,
     stderr_path: Path,
-) -> subprocess.CompletedProcess[str]:
+) -> Generator[dict[str, str], None, int]:
     stdout_path.parent.mkdir(parents=True, exist_ok=True)
     stderr_path.parent.mkdir(parents=True, exist_ok=True)
-    with stdout_path.open("a", encoding="utf-8") as stdout_handle:
-        with stderr_path.open("a", encoding="utf-8") as stderr_handle:
-            return subprocess.run(
-                ["/bin/sh", "-lc", command],
-                cwd=str(cwd),
-                env=env,
-                stdout=stdout_handle,
-                stderr=stderr_handle,
-                text=True,
-                check=False,
-            )
+    proc = subprocess.Popen(
+        ["/bin/sh", "-lc", command],
+        cwd=str(cwd),
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    stdout_fd = proc.stdout.fileno()
+    stderr_fd = proc.stderr.fileno()
+    with stdout_path.open("a", encoding="utf-8") as stdout_file:
+        with stderr_path.open("a", encoding="utf-8") as stderr_file:
+            while True:
+                reads, _, _ = select.select([stdout_fd, stderr_fd], [], [])
+                for fd in reads:
+                    if fd == stdout_fd:
+                        line = proc.stdout.readline()
+                        if line:
+                            stdout_file.write(line)
+                            stdout_file.flush()
+                            sys.stdout.write(line)
+                            sys.stdout.flush()
+                            yield {"stream": "stdout", "text": line}
+                    elif fd == stderr_fd:
+                        line = proc.stderr.readline()
+                        if line:
+                            stderr_file.write(line)
+                            stderr_file.flush()
+                            sys.stderr.write(line)
+                            sys.stderr.flush()
+                            yield {"stream": "stderr", "text": line}
+                if proc.poll() is not None:
+                    for line in proc.stdout:
+                        stdout_file.write(line)
+                        sys.stdout.write(line)
+                        yield {"stream": "stdout", "text": line}
+                    for line in proc.stderr:
+                        stderr_file.write(line)
+                        sys.stderr.write(line)
+                        yield {"stream": "stderr", "text": line}
+                    break
+    return proc.returncode
 
 
-def handler(job: dict[str, Any]) -> dict[str, Any]:
+def _fail(
+    *,
+    run_dir: Path,
+    run_id: str,
+    status_path: Path,
+    manifest_path: Path,
+    status_payload: dict[str, Any],
+    step: str,
+    exit_code: int | None,
+    error: str,
+) -> dict[str, Any]:
+    status_payload.update(
+        {
+            "status": "failed",
+            "step": step,
+            "finished_at": _now(),
+            "exit_code": exit_code,
+            "error": error,
+        }
+    )
+    _persist_run_state(
+        run_dir=run_dir,
+        run_id=run_id,
+        status_path=status_path,
+        manifest_path=manifest_path,
+        status_payload=status_payload,
+    )
+    return {
+        "run_id": run_id,
+        "status": "failed",
+        "error": error,
+        "exit_code": exit_code,
+    }
+
+
+def handler(job: dict[str, Any]) -> Generator[dict[str, str], None, dict[str, Any]]:
     payload = (job or {}).get("input") or {}
     spec = payload.get("quadra") if isinstance(payload.get("quadra"), dict) else payload
 
@@ -144,94 +215,68 @@ def handler(job: dict[str, Any]) -> dict[str, Any]:
     )
 
     if not project_dir.exists():
-        status_payload.update(
-            {
-                "status": "failed",
-                "step": "prepare",
-                "finished_at": _now(),
-                "error": f"Project directory does not exist: {project_dir}",
-            }
-        )
-        _persist_run_state(
+        return _fail(
             run_dir=run_dir,
             run_id=run_id,
             status_path=status_path,
             manifest_path=manifest_path,
             status_payload=status_payload,
+            step="prepare",
+            exit_code=None,
+            error=f"Project directory does not exist: {project_dir}",
         )
-        raise RuntimeError(status_payload["error"])
 
     if not experiment_dir.exists():
-        status_payload.update(
-            {
-                "status": "failed",
-                "step": "prepare",
-                "finished_at": _now(),
-                "error": f"Experiment directory does not exist: {experiment_dir}",
-            }
-        )
-        _persist_run_state(
+        return _fail(
             run_dir=run_dir,
             run_id=run_id,
             status_path=status_path,
             manifest_path=manifest_path,
             status_payload=status_payload,
+            step="prepare",
+            exit_code=None,
+            error=f"Experiment directory does not exist: {experiment_dir}",
         )
-        raise RuntimeError(status_payload["error"])
 
     setup_command = spec.get("setup_command")
     if setup_command:
-        setup_result = _run_shell(
+        setup_rc = yield from _run_streaming(
             str(setup_command),
             cwd=project_dir,
             env=env,
             stdout_path=stdout_path,
             stderr_path=stderr_path,
         )
-        if setup_result.returncode != 0:
-            status_payload.update(
-                {
-                    "status": "failed",
-                    "step": "setup",
-                    "finished_at": _now(),
-                    "exit_code": setup_result.returncode,
-                    "error": f"Setup command failed with exit code {setup_result.returncode}",
-                }
-            )
-            _persist_run_state(
+        if setup_rc != 0:
+            return _fail(
                 run_dir=run_dir,
                 run_id=run_id,
                 status_path=status_path,
                 manifest_path=manifest_path,
                 status_payload=status_payload,
+                step="setup",
+                exit_code=setup_rc,
+                error=f"Setup command failed with exit code {setup_rc}",
             )
-            raise RuntimeError(status_payload["error"])
 
-    command_result = _run_shell(
+    command_rc = yield from _run_streaming(
         str(spec["command"]),
         cwd=experiment_dir,
         env=env,
         stdout_path=stdout_path,
         stderr_path=stderr_path,
     )
-    if command_result.returncode != 0:
-        status_payload.update(
-            {
-                "status": "failed",
-                "step": "command",
-                "finished_at": _now(),
-                "exit_code": command_result.returncode,
-                "error": f"Command failed with exit code {command_result.returncode}",
-            }
-        )
-        _persist_run_state(
+    if command_rc != 0:
+        return _fail(
             run_dir=run_dir,
             run_id=run_id,
             status_path=status_path,
             manifest_path=manifest_path,
             status_payload=status_payload,
+            step="command",
+            exit_code=command_rc,
+            error=f"Command failed with exit code {command_rc}",
         )
-        raise RuntimeError(status_payload["error"])
 
     status_payload.update(
         {
@@ -269,7 +314,7 @@ def main() -> None:
 
     _append_bootstrap_log("imported runpod")
     _append_bootstrap_log("starting runpod.serverless.start")
-    runpod.serverless.start({"handler": handler})
+    runpod.serverless.start({"handler": handler, "return_aggregate_stream": True})
 
 
 if __name__ == "__main__":

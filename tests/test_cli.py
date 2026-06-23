@@ -114,6 +114,7 @@ class FakeRunpodClient:
         self.deleted_endpoints: list[str] = []
         self.jobs: dict[str, dict[str, object]] = {}
         self.submissions: list[dict[str, object]] = []
+        self.stream_chunks: dict[str, list[dict[str, object]]] = {}
 
     def get_network_volumes(self) -> list[dict[str, object]]:
         return list(self.volumes)
@@ -237,11 +238,21 @@ class FakeRunpodClient:
             "status": "COMPLETED",
             "output": {"run_id": run_id},
         }
+        self.stream_chunks[job_id] = [
+            {
+                "output": {"stream": "stdout", "text": f"bonsai {workflow} remote\n"},
+                "metrics": {"stream_index": 0},
+            }
+        ]
         return {"id": job_id}
 
     def get_job(self, endpoint_id: str, job_id: str, *, source: str = "status") -> dict[str, object]:
         del endpoint_id, source
         return dict(self.jobs[job_id])
+
+    def stream_job(self, endpoint_id: str, job_id: str) -> list[dict[str, object]]:
+        del endpoint_id
+        return list(self.stream_chunks.get(job_id, []))
 
     @staticmethod
     def remote_key_prefix(run_dir: str) -> str:
@@ -328,6 +339,22 @@ class PollingFakeRunpodClient(FakeRunpodClient):
 
         self.jobs[job_id]["status"] = status
         return dict(self.jobs[job_id])
+
+    def stream_job(self, endpoint_id: str, job_id: str) -> list[dict[str, object]]:
+        del endpoint_id
+        job = self.jobs.get(job_id)
+        if job is None:
+            return []
+        status = str(job["status"])
+        if status not in ("IN_PROGRESS", "COMPLETED"):
+            return []
+        workflow = self.job_workflows.get(job_id, "")
+        return [
+            {
+                "output": {"stream": "stdout", "text": f"bonsai {workflow} remote\n"},
+                "metrics": {"stream_index": 0},
+            }
+        ]
 
 
 class BootstrapLoggingPollingFakeRunpodClient(PollingFakeRunpodClient):
@@ -1006,7 +1033,7 @@ class QuadraCLITestCase(unittest.TestCase):
                 config,
             )
             self.assertIn(
-                'image_name = "pytorch/pytorch:2.12.1-cuda12.6-cudnn9-runtime"',
+                'image_name = "pytorch/pytorch:2.12.1-cuda13.2-cudnn9-runtime"',
                 config,
             )
             self.assertIn(
@@ -1927,7 +1954,7 @@ class QuadraCLITestCase(unittest.TestCase):
                         self.assertEqual(logs_result.exit_code, 0, logs_result.output)
                         self.assertIn("[quadra] connecting to RunPod S3 volume", logs_result.output)
                         self.assertIn(
-                            "[quadra] streaming worker stdout from RunPod...",
+                            "[quadra] streaming worker output from RunPod...",
                             logs_result.output,
                         )
                         self.assertIn("bonsai smoke remote", logs_result.output)

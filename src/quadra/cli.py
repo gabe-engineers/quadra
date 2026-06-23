@@ -27,6 +27,8 @@ from quadra import __version__
 from quadra.errors import QuadraError
 from quadra.runpod_rest import RunpodRestClient
 
+logger = logging.getLogger("quadra")
+
 CONFIG_FILENAME = "quadra.toml"
 GLOBAL_CONFIG_ENV = "QUADRA_CONFIG"
 GLOBAL_CONFIG_PATH = Path("~/.config/quadra/config.toml")
@@ -57,12 +59,14 @@ DEFAULT_TEMPLATE_BOOTSTRAP_COMMAND = textwrap.dedent(
     worker_site_packages="{project_dir}/.quadra/worker-site-packages"
     mkdir -p "$(dirname "$bootstrap_log")"
     : > "$bootstrap_log"
-    {
+    _rc_file=/tmp/quadra-bootstrap-$$
+    (
       echo "[runpod bootstrap] started $(date -u +%Y-%m-%dT%H:%M:%SZ)"
       echo "[runpod bootstrap] python: $(python --version 2>&1)"
       echo "[runpod bootstrap] worker path: $worker_path"
       if [ ! -f "$worker_path" ]; then
         echo "[runpod bootstrap] worker script missing"
+        echo 1 > "$_rc_file"
         exit 1
       fi
       if python -c 'import runpod' >/dev/null 2>&1; then
@@ -82,7 +86,7 @@ DEFAULT_TEMPLATE_BOOTSTRAP_COMMAND = textwrap.dedent(
             worker_python="$isolated_worker_python"
           elif "$isolated_worker_python" -m pip --version >/dev/null 2>&1; then
             echo "[runpod bootstrap] installing python package 'runpod' into isolated worker runtime"
-            "$isolated_worker_python" -m pip install --disable-pip-version-check --no-cache-dir runpod || exit 1
+            "$isolated_worker_python" -m pip install --disable-pip-version-check --no-cache-dir runpod || { echo 1 > "$_rc_file"; exit 1; }
             worker_python="$isolated_worker_python"
           else
             echo "[runpod bootstrap] isolated worker runtime is missing pip, falling back to isolated package directory at $worker_site_packages"
@@ -95,12 +99,17 @@ DEFAULT_TEMPLATE_BOOTSTRAP_COMMAND = textwrap.dedent(
           else
             echo "[runpod bootstrap] installing python package 'runpod' into isolated package directory"
             mkdir -p "$worker_site_packages"
-            python -m pip install --disable-pip-version-check --no-cache-dir --target "$worker_site_packages" runpod || exit 1
+            python -m pip install --disable-pip-version-check --no-cache-dir --target "$worker_site_packages" runpod || { echo 1 > "$_rc_file"; exit 1; }
           fi
         fi
       fi
       echo "[runpod bootstrap] launching worker"
-    } >>"$bootstrap_log" 2>&1 && exec "$worker_python" -u "$worker_path" >>"$bootstrap_log" 2>&1
+      echo 0 > "$_rc_file"
+    ) 2>&1 | tee -a "$bootstrap_log"
+    _bootstrap_rc=$(cat "$_rc_file" 2>/dev/null || echo 1)
+    rm -f "$_rc_file"
+    if [ "$_bootstrap_rc" != "0" ]; then exit 1; fi
+    exec "$worker_python" -u "$worker_path"
     """
 ).strip()
 PREVIOUS_TEMPLATE_BOOTSTRAP_COMMAND_VENV = textwrap.dedent(
@@ -727,11 +736,47 @@ class RunpodClient:
 
     def get_job(
         self, endpoint_id: str, job_id: str, *, source: str = "status"
-    ) -> dict[str, Any]:
-        return self._endpoint_request(
-            "GET",
-            f"{endpoint_id}/{source}/{job_id}",
-        )
+    ) -> dict[str, Any] | None:
+        try:
+            return self._endpoint_request(
+                "GET",
+                f"{endpoint_id}/{source}/{job_id}",
+            )
+        except QuadraError as exc:
+            if "HTTP 404" in str(exc):
+                return None
+            if "timed out" in str(exc).lower():
+                return None
+            raise
+
+    def stream_job(self, endpoint_id: str, job_id: str) -> list[dict[str, Any]]:
+        url = f"{self.endpoint_base_url}/{endpoint_id}/stream/{job_id}"
+        headers = {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {self.api_key}",
+        }
+        try:
+            response = httpx.request("GET", url, headers=headers, timeout=30)
+        except httpx.TimeoutException:
+            return []
+        except httpx.HTTPError as exc:
+            raise QuadraError(f"RunPod endpoint request failed: {exc}") from exc
+        if response.status_code == HTTPStatus.UNAUTHORIZED:
+            raise QuadraError("Unauthorized request, please check your RunPod API key.")
+        if response.status_code == HTTPStatus.NOT_FOUND:
+            return []
+        if response.status_code >= HTTPStatus.BAD_REQUEST:
+            message = response.text.strip() or response.reason_phrase or str(response.status_code)
+            raise QuadraError(
+                f"RunPod endpoint API returned HTTP {response.status_code}: {message}"
+            )
+        try:
+            parsed = response.json()
+        except ValueError as exc:
+            raise QuadraError("RunPod endpoint API returned an invalid JSON response.") from exc
+        if isinstance(parsed, list):
+            return parsed
+        return []
 
     def get_endpoint(
         self, endpoint_id: str, *, include_workers: bool = False
@@ -3235,12 +3280,36 @@ def submit_workflow(
     return reference, endpoint
 
 
-def read_text_object(s3: Any, bucket: str, key: str) -> str:
+def read_text_object(
+    s3: Any, bucket: str, key: str, *, label: str | None = None
+) -> str:
+    tag = f"[{label}] " if label else ""
     try:
         response = s3.get_object(Bucket=bucket, Key=key)
-    except Exception:
+    except Exception as exc:
+        logger.warning(
+            "%sget_object failed for s3://%s/%s: %s: %s",
+            tag,
+            bucket,
+            key,
+            type(exc).__name__,
+            exc,
+        )
         return ""
-    body = response["Body"].read()
+    try:
+        body = response["Body"].read()
+    except Exception as exc:
+        logger.warning(
+            "%sbody read failed for s3://%s/%s: %s: %s",
+            tag,
+            bucket,
+            key,
+            type(exc).__name__,
+            exc,
+        )
+        return ""
+    if not body:
+        logger.debug("%sempty body for s3://%s/%s", tag, bucket, key)
     return body.decode("utf-8", errors="replace")
 
 
@@ -3345,16 +3414,13 @@ def stream_logs(config: ProjectConfig, reference: RunReference, *, follow: bool)
     )
     s3 = build_s3_client(config, volume)
 
-    stdout_key = remote_run_file_key(config, reference.run_id, "stdout.log")
-    stderr_key = remote_run_file_key(config, reference.run_id, "stderr.log")
     bootstrap_key = remote_state_file_key(config, WORKER_BOOTSTRAP_LOG_FILENAME)
-    last_stdout = ""
-    last_stderr = ""
+    status_key = remote_run_file_key(config, reference.run_id, "status.json")
     last_bootstrap = ""
-    announced_stdout = False
-    announced_stderr = False
     announced_bootstrap = False
+    announced_stream = False
     has_remote_output = False
+    last_stream_index = -1
     last_reported_status: str | None = None
     last_progress_at = 0.0
     submitted_at = parse_utc_timestamp(reference.submitted_at)
@@ -3362,36 +3428,8 @@ def stream_logs(config: ProjectConfig, reference: RunReference, *, follow: bool)
 
     while True:
         saw_output_this_iteration = False
-        stdout_text = read_text_object(s3, volume.id, stdout_key)
-        stderr_text = read_text_object(s3, volume.id, stderr_key)
-        bootstrap_text = read_text_object(s3, volume.id, bootstrap_key)
 
-        if stdout_text.startswith(last_stdout):
-            chunk = stdout_text[len(last_stdout) :]
-        else:
-            chunk = stdout_text
-        if chunk:
-            if not announced_stdout:
-                report_remote_stream("worker stdout")
-                announced_stdout = True
-            click.echo(chunk, nl=False)
-            has_remote_output = True
-            saw_output_this_iteration = True
-        last_stdout = stdout_text
-
-        if stderr_text.startswith(last_stderr):
-            chunk = stderr_text[len(last_stderr) :]
-        else:
-            chunk = stderr_text
-        if chunk:
-            if not announced_stderr:
-                report_remote_stream("worker stderr")
-                announced_stderr = True
-            click.echo(chunk, err=True, nl=False)
-            has_remote_output = True
-            saw_output_this_iteration = True
-        last_stderr = stderr_text
-
+        bootstrap_text = read_text_object(s3, volume.id, bootstrap_key, label="bootstrap")
         if bootstrap_text.startswith(last_bootstrap):
             chunk = bootstrap_text[len(last_bootstrap) :]
         else:
@@ -3401,11 +3439,48 @@ def stream_logs(config: ProjectConfig, reference: RunReference, *, follow: bool)
                 report_remote_stream("worker bootstrap log")
                 announced_bootstrap = True
             click.echo(chunk, nl=False)
+            has_remote_output = True
             saw_output_this_iteration = True
         last_bootstrap = bootstrap_text
 
+        stream_chunks = client.stream_job(reference.endpoint_id, reference.job_id)
+        if isinstance(stream_chunks, list):
+            for chunk_item in stream_chunks:
+                if not isinstance(chunk_item, dict):
+                    continue
+                metrics = chunk_item.get("metrics")
+                if isinstance(metrics, dict):
+                    idx = metrics.get("stream_index")
+                    if isinstance(idx, int):
+                        if idx <= last_stream_index:
+                            continue
+                        last_stream_index = idx
+                output = chunk_item.get("output")
+                if isinstance(output, dict):
+                    stream_name = str(output.get("stream", "stdout"))
+                    text = str(output.get("text", ""))
+                    if text:
+                        if not announced_stream:
+                            report_remote_stream("worker output")
+                            announced_stream = True
+                        click.echo(text, nl=False, err=(stream_name == "stderr"))
+                        has_remote_output = True
+                        saw_output_this_iteration = True
+
         job = client.get_job(reference.endpoint_id, reference.job_id)
-        status = str(job["status"])
+        if job is not None:
+            status = str(job["status"])
+        else:
+            status_text = read_text_object(s3, volume.id, status_key, label="status")
+            if status_text:
+                try:
+                    status_payload = json.loads(status_text)
+                    status = str(status_payload.get("status", "COMPLETED")).upper()
+                except json.JSONDecodeError:
+                    status = "COMPLETED"
+            else:
+                status = "COMPLETED"
+
         elapsed_seconds = 0
         if submitted_at is not None:
             elapsed_seconds = max(
