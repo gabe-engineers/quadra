@@ -473,6 +473,50 @@ class ExitedWorkerPollingFakeRunpodClient(PollingFakeRunpodClient):
         return endpoint
 
 
+class CrashingWorkerQueuedFakeRunpodClient(FakeRunpodClient):
+    bootstrap_log = (
+        b"[runpod bootstrap] started 2026-06-23T17:19:19Z\n"
+        b"[runpod bootstrap] python: Python 3.12.3\n"
+        b"[runpod bootstrap] worker path: /runpod-volume/.quadra/quadra_worker.py\n"
+        b"[runpod bootstrap] isolated worker runtime is missing pip, "
+        b"falling back to isolated package directory at "
+        b"/runpod-volume/projects/bonsai/.quadra/worker-site-packages\n"
+        b"[runpod bootstrap] python package 'runpod' already available "
+        b"in isolated package directory\n"
+        b"[runpod bootstrap] launching worker\n"
+    )
+
+    def run_job(self, endpoint_id: str, request_input: dict[str, object]) -> dict[str, object]:
+        del request_input
+        job_id = f"job-{len(self.submissions) + 1}"
+        self.submissions.append({"endpoint_id": endpoint_id})
+        self.jobs[job_id] = {
+            "id": job_id,
+            "status": "IN_QUEUE",
+        }
+        self.s3.objects["projects/bonsai/.quadra/worker-bootstrap.log"] = (
+            self.bootstrap_log
+        )
+        return {"id": job_id}
+
+    def get_job(self, endpoint_id: str, job_id: str, *, source: str = "status") -> dict[str, object]:
+        del endpoint_id, source
+        return dict(self.jobs[job_id])
+
+    def get_endpoint(
+        self, endpoint_id: str, *, include_workers: bool = False
+    ) -> dict[str, object]:
+        endpoint = super().get_endpoint(endpoint_id, include_workers=include_workers)
+        endpoint["workers"] = [
+            {
+                "id": "worker-1",
+                "desiredStatus": "EXITED",
+                "lastStatusChange": "Exited by Runpod: Fri Jun 23 2026 17:20:30 GMT+0000",
+            }
+        ]
+        return endpoint
+
+
 class QuadraCLITestCase(unittest.TestCase):
     def setUp(self) -> None:
         self.runner = CliRunner()
@@ -2177,6 +2221,155 @@ class QuadraCLITestCase(unittest.TestCase):
             self.assertIn("workers: 1 exited", result.output)
             self.assertNotIn("has no viable workers while job", result.output)
             self.assertIn("[quadra] smoke: completed", result.output)
+
+    def test_smoke_fails_fast_when_exited_workers_persist_while_queued(self) -> None:
+        with self.runner.isolated_filesystem():
+            init_result = self.runner.invoke(cli, ["init", "bonsai"])
+            self.assertEqual(init_result.exit_code, 0, init_result.output)
+
+            fake_s3 = FakeS3Client()
+            fake_client = CrashingWorkerQueuedFakeRunpodClient(fake_s3)
+
+            monotonic_calls = [0]
+
+            def fake_monotonic() -> float:
+                monotonic_calls[0] += 1
+                if monotonic_calls[0] <= 1:
+                    return 1000.0
+                return 1061.0
+
+            with chdir("bonsai"):
+                with patch("quadra.cli.load_runpod_client", return_value=fake_client):
+                    with patch("quadra.cli.build_s3_client", return_value=fake_s3):
+                        with patch("quadra.cli.time.sleep", return_value=None):
+                            with patch(
+                                "quadra.cli.time.monotonic",
+                                side_effect=fake_monotonic,
+                            ):
+                                result = self.runner.invoke(cli, ["smoke"])
+
+            self.assertNotEqual(result.exit_code, 0)
+            self.assertIn("workers: 1 exited", result.output)
+            self.assertIn("has no viable workers while job", result.output)
+            self.assertIn("exited and no replacement worker started", result.output)
+            self.assertIn("worker bootstrap is failing repeatedly", result.output)
+            self.assertIn("Last worker bootstrap log lines:", result.output)
+            self.assertIn("[runpod bootstrap] launching worker", result.output)
+
+    def test_smoke_does_not_bail_out_for_exited_worker_within_threshold(self) -> None:
+        with self.runner.isolated_filesystem():
+            init_result = self.runner.invoke(cli, ["init", "bonsai"])
+            self.assertEqual(init_result.exit_code, 0, init_result.output)
+
+            fake_s3 = FakeS3Client()
+            fake_client = ExitedWorkerPollingFakeRunpodClient(fake_s3)
+
+            monotonic_calls = [0]
+
+            def fake_monotonic() -> float:
+                monotonic_calls[0] += 1
+                return 1000.0 + monotonic_calls[0]
+
+            with chdir("bonsai"):
+                with patch("quadra.cli.load_runpod_client", return_value=fake_client):
+                    with patch("quadra.cli.build_s3_client", return_value=fake_s3):
+                        with patch("quadra.cli.time.sleep", return_value=None):
+                            with patch(
+                                "quadra.cli.time.monotonic",
+                                side_effect=fake_monotonic,
+                            ):
+                                result = self.runner.invoke(cli, ["smoke"])
+
+            self.assertEqual(result.exit_code, 0, result.output)
+            self.assertIn("workers: 1 exited", result.output)
+            self.assertIn("[quadra] smoke: completed", result.output)
+            self.assertNotIn("worker bootstrap is failing repeatedly", result.output)
+
+    def test_smoke_fails_fast_for_exited_workers_without_bootstrap_log(self) -> None:
+        with self.runner.isolated_filesystem():
+            init_result = self.runner.invoke(cli, ["init", "bonsai"])
+            self.assertEqual(init_result.exit_code, 0, init_result.output)
+
+            fake_s3 = FakeS3Client()
+            fake_client = CrashingWorkerQueuedFakeRunpodClient(fake_s3)
+            fake_client.bootstrap_log = b""
+
+            monotonic_calls = [0]
+
+            def fake_monotonic() -> float:
+                monotonic_calls[0] += 1
+                if monotonic_calls[0] <= 1:
+                    return 1000.0
+                return 1061.0
+
+            with chdir("bonsai"):
+                with patch("quadra.cli.load_runpod_client", return_value=fake_client):
+                    with patch("quadra.cli.build_s3_client", return_value=fake_s3):
+                        with patch("quadra.cli.time.sleep", return_value=None):
+                            with patch(
+                                "quadra.cli.time.monotonic",
+                                side_effect=fake_monotonic,
+                            ):
+                                result = self.runner.invoke(cli, ["smoke"])
+
+            self.assertNotEqual(result.exit_code, 0)
+            self.assertIn("has no viable workers while job", result.output)
+            self.assertIn("No worker bootstrap log was produced", result.output)
+
+    def test_inspect_endpoint_queue_reports_exited_workers_when_none_running(self) -> None:
+        from quadra.cli import inspect_endpoint_queue
+
+        endpoint = {
+            "workers": [
+                {
+                    "id": "worker-1",
+                    "desiredStatus": "EXITED",
+                    "lastStatusChange": "Exited by Runpod: Fri Jun 23 2026 17:20:30 GMT+0000",
+                }
+            ]
+        }
+        diagnostics = inspect_endpoint_queue(endpoint)
+        self.assertEqual(diagnostics.exited_workers, ("worker-1 (EXITED; Exited by Runpod: Fri Jun 23 2026 17:20:30 GMT+0000)",))
+        self.assertEqual(diagnostics.blocking_workers, ())
+
+    def test_inspect_endpoint_queue_omits_exited_workers_when_a_worker_is_starting(self) -> None:
+        from quadra.cli import inspect_endpoint_queue
+
+        endpoint = {
+            "workers": [
+                {
+                    "id": "worker-1",
+                    "desiredStatus": "EXITED",
+                    "lastStatusChange": "Exited by Runpod: Fri Jun 23 2026 17:20:30 GMT+0000",
+                },
+                {
+                    "id": "worker-2",
+                    "desiredStatus": "RUNNING",
+                    "lastStatusChange": "",
+                },
+            ]
+        }
+        diagnostics = inspect_endpoint_queue(endpoint)
+        self.assertEqual(diagnostics.exited_workers, ())
+        self.assertEqual(diagnostics.blocking_workers, ())
+        self.assertIn("1 running", diagnostics.progress_summary or "")
+        self.assertIn("1 exited", diagnostics.progress_summary or "")
+
+    def test_format_bootstrap_log_tail_returns_short_log_unchanged(self) -> None:
+        from quadra.cli import format_bootstrap_log_tail
+
+        text = "[runpod bootstrap] started 2026-06-23T17:19:19Z\n[runpod bootstrap] launching worker\n"
+        self.assertEqual(
+            format_bootstrap_log_tail(text),
+            "[runpod bootstrap] started 2026-06-23T17:19:19Z\n[runpod bootstrap] launching worker",
+        )
+
+    def test_format_bootstrap_log_tail_truncates_to_last_lines(self) -> None:
+        from quadra.cli import format_bootstrap_log_tail
+
+        text = "\n".join(f"line {i}" for i in range(100))
+        tail = format_bootstrap_log_tail(text, max_lines=5)
+        self.assertEqual(tail, "\n".join(f"line {i}" for i in range(95, 100)))
 
     def test_smoke_times_out_when_job_stays_queued_without_workers(self) -> None:
         with self.runner.isolated_filesystem():

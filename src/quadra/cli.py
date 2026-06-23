@@ -45,6 +45,8 @@ DEFAULT_PROJECT_DIR = "{volume_mount_path}/projects/{project_name}"
 FINAL_JOB_STATES = {"COMPLETED", "FAILED", "TIMED_OUT", "CANCELLED"}
 POLL_PROGRESS_INTERVAL_SECONDS = 10
 DEFAULT_RUNPOD_QUEUE_TIMEOUT_SECONDS = 300
+DEFAULT_RUNPOD_ALL_EXITED_THRESHOLD_SECONDS = 60
+BOOTSTRAP_LOG_TAIL_LINES = 40
 QUADRA_WORKER_FILENAME = "quadra_worker.py"
 DEFAULT_TEMPLATE_IMAGE = "pytorch/pytorch:2.12.1-cuda13.2-cudnn9-runtime"
 DEFAULT_RUNPOD_ENDPOINT_API_BASE_URL = "https://api.runpod.ai/v2"
@@ -60,6 +62,8 @@ DEFAULT_TEMPLATE_BOOTSTRAP_COMMAND = textwrap.dedent(
     mkdir -p "$(dirname "$bootstrap_log")"
     : > "$bootstrap_log"
     _rc_file=/tmp/quadra-bootstrap-$$
+    _worker_python_file=/tmp/quadra-worker-python-$$
+    _worker_env_file=/tmp/quadra-worker-env-$$
     (
       echo "[runpod bootstrap] started $(date -u +%Y-%m-%dT%H:%M:%SZ)"
       echo "[runpod bootstrap] python: $(python --version 2>&1)"
@@ -83,18 +87,19 @@ DEFAULT_TEMPLATE_BOOTSTRAP_COMMAND = textwrap.dedent(
         if [ -x "$isolated_worker_python" ]; then
           if "$isolated_worker_python" -c 'import runpod' >/dev/null 2>&1; then
             echo "[runpod bootstrap] python package 'runpod' already available in isolated worker runtime"
-            worker_python="$isolated_worker_python"
+            printf '%s\n' "$isolated_worker_python" > "$_worker_python_file"
           elif "$isolated_worker_python" -m pip --version >/dev/null 2>&1; then
             echo "[runpod bootstrap] installing python package 'runpod' into isolated worker runtime"
             "$isolated_worker_python" -m pip install --disable-pip-version-check --no-cache-dir runpod || { echo 1 > "$_rc_file"; exit 1; }
-            worker_python="$isolated_worker_python"
+            printf '%s\n' "$isolated_worker_python" > "$_worker_python_file"
           else
             echo "[runpod bootstrap] isolated worker runtime is missing pip, falling back to isolated package directory at $worker_site_packages"
           fi
         fi
-        if [ "$worker_python" = "python" ]; then
-          export PYTHONPATH="$worker_site_packages${PYTHONPATH:+:$PYTHONPATH}"
-          if python -c 'import runpod' >/dev/null 2>&1; then
+        if [ ! -f "$_worker_python_file" ]; then
+          printf '%s\n' "$worker_site_packages" > "$_worker_env_file"
+          PYTHONPATH="$worker_site_packages${PYTHONPATH:+:$PYTHONPATH}" python -c 'import runpod' >/dev/null 2>&1
+          if [ $? -eq 0 ]; then
             echo "[runpod bootstrap] python package 'runpod' already available in isolated package directory"
           else
             echo "[runpod bootstrap] installing python package 'runpod' into isolated package directory"
@@ -108,7 +113,18 @@ DEFAULT_TEMPLATE_BOOTSTRAP_COMMAND = textwrap.dedent(
     ) 2>&1 | tee -a "$bootstrap_log"
     _bootstrap_rc=$(cat "$_rc_file" 2>/dev/null || echo 1)
     rm -f "$_rc_file"
-    if [ "$_bootstrap_rc" != "0" ]; then exit 1; fi
+    if [ "$_bootstrap_rc" != "0" ]; then
+      rm -f "$_worker_python_file" "$_worker_env_file"
+      exit 1
+    fi
+    if [ -f "$_worker_python_file" ]; then
+      worker_python=$(cat "$_worker_python_file")
+    fi
+    if [ -f "$_worker_env_file" ]; then
+      _extra_path=$(cat "$_worker_env_file")
+      export PYTHONPATH="${_extra_path}${PYTHONPATH:+:$PYTHONPATH}"
+    fi
+    rm -f "$_worker_python_file" "$_worker_env_file"
     exec "$worker_python" -u "$worker_path"
     """
 ).strip()
@@ -459,6 +475,7 @@ class RunReference:
 class EndpointQueueDiagnostics:
     progress_summary: str | None = None
     blocking_workers: tuple[str, ...] = ()
+    exited_workers: tuple[str, ...] = ()
 
 
 def supports_color(stream: Any | None = None) -> bool:
@@ -983,6 +1000,19 @@ def runpod_queue_timeout_seconds() -> int:
         return DEFAULT_RUNPOD_QUEUE_TIMEOUT_SECONDS
     if parsed <= 0:
         return DEFAULT_RUNPOD_QUEUE_TIMEOUT_SECONDS
+    return parsed
+
+
+def runpod_all_exited_threshold_seconds() -> int:
+    raw_value = os.getenv("QUADRA_RUNPOD_ALL_EXITED_THRESHOLD_SECONDS")
+    if raw_value is None:
+        return DEFAULT_RUNPOD_ALL_EXITED_THRESHOLD_SECONDS
+    try:
+        parsed = int(raw_value)
+    except ValueError:
+        return DEFAULT_RUNPOD_ALL_EXITED_THRESHOLD_SECONDS
+    if parsed <= 0:
+        return DEFAULT_RUNPOD_ALL_EXITED_THRESHOLD_SECONDS
     return parsed
 
 
@@ -3095,6 +3125,17 @@ def format_duration(seconds: int) -> str:
     return f"{hours}h{remaining_minutes:02d}m{remaining_seconds:02d}s"
 
 
+def format_bootstrap_log_tail(
+    text: str, *, max_lines: int = BOOTSTRAP_LOG_TAIL_LINES
+) -> str:
+    if not text:
+        return ""
+    lines = text.splitlines()
+    if len(lines) <= max_lines:
+        return text.rstrip()
+    return "\n".join(lines[-max_lines:]).rstrip()
+
+
 def describe_job_status(status: str, *, has_remote_output: bool) -> str:
     if status == "IN_QUEUE":
         return "queued on RunPod"
@@ -3184,6 +3225,7 @@ def inspect_endpoint_queue(
     starting_count = 0
     exited_count = 0
     blocked_workers: list[str] = []
+    exited_workers: list[str] = []
     for worker in workers:
         desired_status = optional_str(worker.get("desiredStatus")) or optional_str(
             worker.get("desired_status")
@@ -3199,6 +3241,7 @@ def inspect_endpoint_queue(
             continue
         if is_terminal:
             exited_count += 1
+            exited_workers.append(format_worker_diagnostic(worker))
             continue
         starting_count += 1
 
@@ -3219,6 +3262,12 @@ def inspect_endpoint_queue(
         return EndpointQueueDiagnostics(
             progress_summary=summary,
             blocking_workers=tuple(blocked_workers),
+        )
+
+    if exited_workers and not running_count and not starting_count:
+        return EndpointQueueDiagnostics(
+            progress_summary=summary,
+            exited_workers=tuple(exited_workers),
         )
 
     return EndpointQueueDiagnostics(progress_summary=summary)
@@ -3425,6 +3474,8 @@ def stream_logs(config: ProjectConfig, reference: RunReference, *, follow: bool)
     last_progress_at = 0.0
     submitted_at = parse_utc_timestamp(reference.submitted_at)
     queue_timeout_seconds = runpod_queue_timeout_seconds()
+    all_exited_threshold_seconds = runpod_all_exited_threshold_seconds()
+    all_exited_since: float | None = None
 
     while True:
         saw_output_this_iteration = False
@@ -3523,6 +3574,12 @@ def stream_logs(config: ProjectConfig, reference: RunReference, *, follow: bool)
             last_reported_status = status
             last_progress_at = now_monotonic
 
+        if status == "IN_QUEUE" and queue_diagnostics.exited_workers:
+            if all_exited_since is None:
+                all_exited_since = now_monotonic
+        else:
+            all_exited_since = None
+
         if status == "IN_QUEUE" and queue_diagnostics.blocking_workers:
             worker_details = "; ".join(queue_diagnostics.blocking_workers[:3])
             raise QuadraError(
@@ -3530,6 +3587,35 @@ def stream_logs(config: ProjectConfig, reference: RunReference, *, follow: bool)
                 f"job {reference.job_id} is still queued: {worker_details}. "
                 "Check the template image and worker startup command."
             )
+
+        if (
+            status == "IN_QUEUE"
+            and queue_diagnostics.exited_workers
+            and all_exited_since is not None
+            and now_monotonic - all_exited_since >= all_exited_threshold_seconds
+        ):
+            worker_details = "; ".join(queue_diagnostics.exited_workers[:3])
+            bootstrap_tail = format_bootstrap_log_tail(last_bootstrap)
+            message = (
+                f"RunPod endpoint {reference.endpoint_id} has no viable workers while "
+                f"job {reference.job_id} is still queued: worker(s) {worker_details} "
+                f"exited and no replacement worker started within "
+                f"{format_duration(all_exited_threshold_seconds)}. "
+                "The worker bootstrap is failing repeatedly."
+            )
+            if bootstrap_tail:
+                message += (
+                    "\n\nLast worker bootstrap log lines:\n"
+                    f"{bootstrap_tail}\n\n"
+                    "Check the template image, worker startup command, and worker script "
+                    "for errors."
+                )
+            else:
+                message += (
+                    " No worker bootstrap log was produced. Check the template image "
+                    "and worker startup command."
+                )
+            raise QuadraError(message)
 
         if (
             status == "IN_QUEUE"
