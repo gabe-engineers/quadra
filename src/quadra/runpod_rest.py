@@ -132,13 +132,39 @@ def normalize_gpu_type_ids(gpu_ids: str) -> tuple[str, ...]:
     key = gpu_ids.strip()
     if not key:
         raise QuadraError("runtime.runpod.gpu_ids must not be empty.")
-    pool_gpu_types = _REST_GPU_POOL_TO_GPU_TYPES.get(key)
-    if pool_gpu_types:
-        return tuple(_canonicalize_gpu_type_id(value) for value in pool_gpu_types)
 
-    gpu_type_ids = _split_csv(key)
-    if gpu_type_ids:
-        return tuple(_canonicalize_gpu_type_id(value) for value in gpu_type_ids)
+    normalized: list[str] = []
+    for value in _split_csv(key):
+        gpu_type_ids = _REST_GPU_POOL_TO_GPU_TYPES.get(value, (value,))
+        for gpu_type_id in gpu_type_ids:
+            canonical = _canonicalize_gpu_type_id(gpu_type_id)
+            if canonical not in normalized:
+                normalized.append(canonical)
+    if normalized:
+        return tuple(normalized)
+
+    raise QuadraError("runtime.runpod.gpu_ids must not be empty.")
+
+
+def normalize_gpu_type_groups(
+    gpu_ids: str,
+) -> tuple[tuple[str, tuple[str, ...]], ...]:
+    key = gpu_ids.strip()
+    if not key:
+        raise QuadraError("runtime.runpod.gpu_ids must not be empty.")
+
+    values = _split_csv(key)
+    if values:
+        return tuple(
+            (
+                value,
+                tuple(
+                    _canonicalize_gpu_type_id(gpu_type_id)
+                    for gpu_type_id in _REST_GPU_POOL_TO_GPU_TYPES.get(value, (value,))
+                ),
+            )
+            for value in values
+        )
 
     raise QuadraError("runtime.runpod.gpu_ids must not be empty.")
 

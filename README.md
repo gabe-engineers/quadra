@@ -60,6 +60,11 @@ quadra init
 - `quadra run <command>` syncs the current directory, submits the command, streams
   logs, and pulls artifacts. In a directory without `quadra.toml`, Quadra uses the
   machine config and treats the current directory as the experiment root.
+  Pass `--fork <url>` (repeatable) to clone a fork into `src/libs/<repo>/` and wire
+  it as a local editable dependency before running; pair with `--fork-package <name>`
+  when the package name differs from the repo name. This lets a library checkout be
+  the experiment and test it against local versions of its dependencies, e.g.
+  `quadra run --fork https://github.com/me/transformers "pytest"`.
 - `quadra submit <workflow>` submits a workflow job to the configured Serverless endpoint.
 - `quadra fork <fork_url>` clones a fork into `src/libs/<repo>/` and updates
   `src/experiment/pyproject.toml` to use that local checkout as an editable uv source.
@@ -104,7 +109,7 @@ mount_path = "/runpod-volume"
 
 [runpod.serverless]
 endpoint_name = "quadra-dev"
-gpu_ids = "AMPERE_16"
+gpu_ids = ["BLACKWELL_180", "HOPPER_141"]
 gpu_count = 1
 workers_min = 0
 workers_max = 1
@@ -119,6 +124,10 @@ name = "quadra-dev-serverless-worker"
 image_name = "pytorch/pytorch:2.12.1-cuda13.2-cudnn9-runtime"
 container_disk_gb = 20
 ```
+
+`gpu_ids` accepts one pool ID as a string, multiple pool IDs as a TOML list, or
+comma-separated exact RunPod REST GPU type names. Quadra expands pool IDs into
+the `gpuTypeIds` array used by the RunPod Serverless endpoint API.
 
 ## Worker Contract
 

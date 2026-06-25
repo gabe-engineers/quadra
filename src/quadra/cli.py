@@ -25,7 +25,7 @@ import httpx
 
 from quadra import __version__
 from quadra.errors import QuadraError
-from quadra.runpod_rest import RunpodRestClient
+from quadra.runpod_rest import RunpodRestClient, normalize_gpu_type_groups
 
 logger = logging.getLogger("quadra")
 
@@ -44,12 +44,14 @@ DEFAULT_TEMPLATE_VOLUME_MOUNT_PATH = str(RUNPOD_VOLUME_ROOT)
 DEFAULT_PROJECT_DIR = "{volume_mount_path}/projects/{project_name}"
 FINAL_JOB_STATES = {"COMPLETED", "FAILED", "TIMED_OUT", "CANCELLED"}
 POLL_PROGRESS_INTERVAL_SECONDS = 10
+GPU_SUPPLY_REFRESH_INTERVAL_SECONDS = 30
 DEFAULT_RUNPOD_QUEUE_TIMEOUT_SECONDS = 300
 DEFAULT_RUNPOD_ALL_EXITED_THRESHOLD_SECONDS = 60
 BOOTSTRAP_LOG_TAIL_LINES = 40
 QUADRA_WORKER_FILENAME = "quadra_worker.py"
 DEFAULT_TEMPLATE_IMAGE = "pytorch/pytorch:2.12.1-cuda13.2-cudnn9-runtime"
 DEFAULT_RUNPOD_ENDPOINT_API_BASE_URL = "https://api.runpod.ai/v2"
+DEFAULT_RUNPOD_GRAPHQL_API_URL = "https://api.runpod.io/graphql"
 DEFAULT_TEMPLATE_NAME = "quadra-{project_name}-serverless-worker"
 DEFAULT_TEMPLATE_BOOTSTRAP_COMMAND = textwrap.dedent(
     """\
@@ -478,6 +480,12 @@ class EndpointQueueDiagnostics:
     exited_workers: tuple[str, ...] = ()
 
 
+@dataclass(frozen=True)
+class GpuPoolSupply:
+    pool_id: str
+    status: str
+
+
 def supports_color(stream: Any | None = None) -> bool:
     output = stream or sys.stdout
     isatty = getattr(output, "isatty", None)
@@ -803,6 +811,108 @@ class RunpodClient:
             include_workers=include_workers,
         )
 
+    def get_gpu_supply(
+        self,
+        gpu_type_ids: tuple[str, ...],
+        *,
+        data_center_id: str | None,
+        gpu_count: int,
+        allowed_cuda_versions: tuple[str, ...],
+    ) -> dict[str, str | None]:
+        price_input: dict[str, Any] = {
+            "gpuCount": gpu_count,
+            "includeAiApi": True,
+        }
+        if data_center_id:
+            price_input["dataCenterId"] = data_center_id
+        if allowed_cuda_versions:
+            price_input["allowedCudaVersions"] = list(allowed_cuda_versions)
+
+        query = """
+        query QuadraGpuSupply($priceInput: GpuLowestPriceInput) {
+          gpuTypes {
+            id
+            lowestPrice(input: $priceInput) {
+              stockStatus
+            }
+          }
+        }
+        """
+        try:
+            response = httpx.request(
+                "POST",
+                os.getenv(
+                    "RUNPOD_GRAPHQL_API_URL",
+                    DEFAULT_RUNPOD_GRAPHQL_API_URL,
+                ),
+                params={"api_key": self.api_key},
+                headers={"Content-Type": "application/json"},
+                json={
+                    "query": query,
+                    "variables": {"priceInput": price_input},
+                },
+                timeout=10,
+            )
+        except httpx.TimeoutException as exc:
+            raise QuadraError(f"RunPod GPU supply request timed out: {exc}") from exc
+        except httpx.HTTPError as exc:
+            raise QuadraError(f"RunPod GPU supply request failed: {exc}") from exc
+
+        if response.status_code == HTTPStatus.UNAUTHORIZED:
+            raise QuadraError("Unauthorized request, please check your RunPod API key.")
+        if response.status_code >= HTTPStatus.BAD_REQUEST:
+            message = response.text.strip() or response.reason_phrase or str(
+                response.status_code
+            )
+            raise QuadraError(
+                f"RunPod GPU supply API returned HTTP {response.status_code}: {message}"
+            )
+
+        try:
+            payload = response.json()
+        except ValueError as exc:
+            raise QuadraError(
+                "RunPod GPU supply API returned an invalid JSON response."
+            ) from exc
+        if not isinstance(payload, dict):
+            raise QuadraError(
+                "RunPod GPU supply API returned an invalid JSON response."
+            )
+        errors = payload.get("errors")
+        if isinstance(errors, list) and errors:
+            first_error = errors[0]
+            if isinstance(first_error, dict):
+                message = optional_str(first_error.get("message"))
+            else:
+                message = optional_str(first_error)
+            raise QuadraError(
+                f"RunPod GPU supply API returned an error: {message or 'unknown error'}"
+            )
+
+        data = payload.get("data")
+        rows = data.get("gpuTypes") if isinstance(data, dict) else None
+        if not isinstance(rows, list):
+            raise QuadraError(
+                "RunPod GPU supply API returned an invalid GPU type response."
+            )
+
+        requested = set(gpu_type_ids)
+        supply: dict[str, str | None] = {}
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            gpu_type_id = optional_str(row.get("id"))
+            if gpu_type_id not in requested:
+                continue
+            lowest_price = row.get("lowestPrice")
+            stock_status = (
+                optional_str(lowest_price.get("stockStatus"))
+                if isinstance(lowest_price, dict)
+                else None
+            )
+            supply[gpu_type_id] = stock_status
+        return supply
+
     def delete_endpoint(self, endpoint_id: str) -> None:
         self.rest_client.delete_endpoint(endpoint_id)
 
@@ -1104,6 +1214,18 @@ def normalize_str_sequence(value: object | None, field_name: str) -> tuple[str, 
     raise QuadraError(f"{field_name} must be a string or list of strings.")
 
 
+def normalize_gpu_ids_config(value: object | None) -> str:
+    if isinstance(value, str):
+        return value.strip()
+    if isinstance(value, list):
+        if not all(isinstance(item, str) for item in value):
+            raise QuadraError(
+                "runtime.runpod.gpu_ids must be a string or list of strings."
+            )
+        return ",".join(item.strip() for item in value if item.strip())
+    raise QuadraError("runtime.runpod.gpu_ids must be a string or list of strings.")
+
+
 def normalize_string_map(value: object | None, field_name: str) -> dict[str, str]:
     if value is None:
         return {}
@@ -1253,11 +1375,11 @@ def build_project_config(
         endpoint_name=merged_optional_str(
             runpod_data, global_serverless, "endpoint_name"
         ),
-        gpu_ids=str(
+        gpu_ids=normalize_gpu_ids_config(
             runpod_data.get(
                 "gpu_ids", global_serverless.get("gpu_ids", "AMPERE_16")
             )
-        ).strip(),
+        ),
         gpu_count=int(
             runpod_data.get("gpu_count", global_serverless.get("gpu_count", 1))
         ),
@@ -2026,11 +2148,18 @@ def wire_experiment_to_local_fork(
     *,
     package_name: str,
     lib_dir: Path,
-) -> Path:
+) -> tuple[Path, bool]:
+    """Wire the experiment to a local fork checkout.
+
+    Returns (pyproject_path, wired). When the experiment pyproject has no
+    PEP 621 [project] table (e.g. setup.py-based libraries like diffusers),
+    uv [tool.uv.sources] redirection does not apply, so wiring is skipped and
+    wired=False is returned. The fork is still cloned and synced.
+    """
     experiment_dir = config.root / config.paths.experiment
     pyproject_path = experiment_dir / "pyproject.toml"
     if not pyproject_path.exists():
-        raise QuadraError(f"Experiment pyproject.toml not found: {pyproject_path}")
+        return pyproject_path, False
 
     try:
         text = pyproject_path.read_text(encoding="utf-8")
@@ -2038,15 +2167,25 @@ def wire_experiment_to_local_fork(
     except (OSError, tomllib.TOMLDecodeError) as exc:
         raise QuadraError(f"Failed to read {pyproject_path}: {exc}") from exc
 
+    if not isinstance(data.get("project"), dict):
+        return pyproject_path, False
+
     source_path = os.path.relpath(lib_dir, experiment_dir).replace(os.sep, "/")
     lines = text.splitlines(keepends=True)
     lines = ensure_project_dependency(lines, data, package_name)
     lines = ensure_uv_path_source(lines, package_name, source_path)
     pyproject_path.write_text("".join(lines), encoding="utf-8")
-    return pyproject_path
+    return pyproject_path, True
 
 
-def prepare_library_destination(config: ProjectConfig, repo_name: str) -> Path:
+def prepare_library_destination(
+    config: ProjectConfig, repo_name: str
+) -> tuple[Path, bool]:
+    """Return (destination, skip_clone).
+
+    skip_clone is True when the destination already exists and is non-empty,
+    so callers can warn and skip re-cloning instead of erroring.
+    """
     libs_dir = config.root / config.paths.libs
     destination = libs_dir / repo_name
     if destination.exists() and not destination.is_dir():
@@ -2061,12 +2200,10 @@ def prepare_library_destination(config: ProjectConfig, repo_name: str) -> Path:
             children[0].unlink()
             children = []
         if children:
-            raise QuadraError(
-                f"Library destination already exists and is not empty: {destination}"
-            )
-    else:
-        destination.parent.mkdir(parents=True, exist_ok=True)
-    return destination
+            return destination, True
+        return destination, False
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    return destination, False
 
 
 def clone_fork_into_project(
@@ -2074,37 +2211,60 @@ def clone_fork_into_project(
     *,
     fork_url: str,
     package_name: str | None = None,
-) -> tuple[Path, Path, str]:
+) -> tuple[Path, Path, str, bool, bool]:
     repo_name = infer_repo_name_from_fork_url(fork_url)
     resolved_package_name = validate_package_name(package_name or repo_name)
-    destination = prepare_library_destination(config, repo_name)
+    destination, skip_clone = prepare_library_destination(config, repo_name)
 
-    experiment_pyproject = config.root / config.paths.experiment / "pyproject.toml"
-    if not experiment_pyproject.exists():
-        raise QuadraError(f"Experiment pyproject.toml not found: {experiment_pyproject}")
-    try:
-        tomllib.loads(experiment_pyproject.read_text(encoding="utf-8"))
-    except (OSError, tomllib.TOMLDecodeError) as exc:
-        raise QuadraError(f"Failed to read {experiment_pyproject}: {exc}") from exc
+    if not skip_clone:
+        try:
+            subprocess.run(
+                ["git", "clone", fork_url, str(destination)],
+                cwd=str(config.root),
+                check=True,
+                text=True,
+            )
+        except FileNotFoundError as exc:
+            raise QuadraError("git is required to clone fork URLs.") from exc
+        except subprocess.CalledProcessError as exc:
+            raise QuadraError(f"Failed to clone fork URL into {destination}.") from exc
 
-    try:
-        subprocess.run(
-            ["git", "clone", fork_url, str(destination)],
-            cwd=str(config.root),
-            check=True,
-            text=True,
-        )
-    except FileNotFoundError as exc:
-        raise QuadraError("git is required to clone fork URLs.") from exc
-    except subprocess.CalledProcessError as exc:
-        raise QuadraError(f"Failed to clone fork URL into {destination}.") from exc
-
-    pyproject_path = wire_experiment_to_local_fork(
+    pyproject_path, wired = wire_experiment_to_local_fork(
         config,
         package_name=resolved_package_name,
         lib_dir=destination,
     )
-    return destination, pyproject_path, resolved_package_name
+    return destination, pyproject_path, resolved_package_name, wired, skip_clone
+
+
+def apply_fork_specs(
+    config: ProjectConfig,
+    fork_specs: list[tuple[str, str | None]],
+) -> None:
+    """Clone and wire each fork URL into the project before running a command."""
+    for fork_url, package_name in fork_specs:
+        destination, _pyproject_path, resolved_package_name, wired, skip_clone = (
+            clone_fork_into_project(
+                config,
+                fork_url=fork_url,
+                package_name=package_name,
+            )
+        )
+        if skip_clone:
+            click.echo(
+                f"warning: library destination already exists, skipping clone: "
+                f"{destination}"
+            )
+        else:
+            click.echo(f"forked {fork_url}")
+        click.echo(f"library: {destination}")
+        click.echo(f"package: {resolved_package_name}")
+        if not wired:
+            click.echo(
+                "note: experiment pyproject has no [project] table; fork cloned "
+                "but not wired as a uv dependency. Wire it via your command or "
+                "setup_command (e.g. PYTHONPATH)."
+            )
 
 
 def load_runpod_client(config: ProjectConfig) -> Any:
@@ -2875,18 +3035,24 @@ def sync_project(config: ProjectConfig) -> tuple[VolumeHandle, int, int]:
         for relative in sorted(local_manifest)
         if remote_manifest.get(relative) != local_manifest[relative]
     ]
-    report_step(f"uploading {len(changed_files)} changed files...")
-    for relative, key in changed_files:
-        managed_payload = managed_files.get(relative)
-        if managed_payload is not None:
-            s3.put_object(
-                Bucket=volume.id,
-                Key=key,
-                Body=managed_payload,
-                ContentType="text/x-python",
-            )
-            continue
-        s3.upload_file(str(local_files[relative]), volume.id, key)
+    if changed_files:
+        with click.progressbar(
+            changed_files,
+            label=f"[quadra] uploading {len(changed_files)} changed files",
+        ) as progress:
+            for relative, key in progress:
+                managed_payload = managed_files.get(relative)
+                if managed_payload is not None:
+                    s3.put_object(
+                        Bucket=volume.id,
+                        Key=key,
+                        Body=managed_payload,
+                        ContentType="text/x-python",
+                    )
+                    continue
+                s3.upload_file(str(local_files[relative]), volume.id, key)
+    else:
+        report_step("uploading 0 changed files...")
 
     expected_keys = {posixpath.join(prefix, relative) for relative in local_manifest}
     expected_keys.add(manifest_key)
@@ -3286,6 +3452,101 @@ def get_endpoint_queue_diagnostics(
     return inspect_endpoint_queue(endpoint)
 
 
+def aggregate_gpu_supply_status(statuses: list[str | None]) -> str:
+    normalized = [
+        status.strip().upper()
+        for status in statuses
+        if isinstance(status, str) and status.strip()
+    ]
+    if not normalized:
+        return "UNKNOWN"
+
+    for status in ("HIGH", "MEDIUM", "LOW"):
+        if status in normalized:
+            return status
+    if all(
+        any(hint in status for hint in ("NONE", "OUT", "UNAVAILABLE", "ZERO"))
+        for status in normalized
+    ):
+        return "UNAVAILABLE"
+    return normalized[0]
+
+
+def unknown_gpu_pool_supply(config: ProjectConfig) -> tuple[GpuPoolSupply, ...]:
+    return tuple(
+        GpuPoolSupply(pool_id=pool_id, status="UNKNOWN")
+        for pool_id, _gpu_type_ids in normalize_gpu_type_groups(
+            config.runtime.runpod.gpu_ids
+        )
+    )
+
+
+def get_gpu_pool_supply(
+    client: Any,
+    config: ProjectConfig,
+    *,
+    data_center_id: str | None,
+) -> tuple[GpuPoolSupply, ...]:
+    groups = normalize_gpu_type_groups(config.runtime.runpod.gpu_ids)
+    unknown = unknown_gpu_pool_supply(config)
+    if not hasattr(client, "get_gpu_supply"):
+        return unknown
+
+    gpu_type_ids = tuple(
+        gpu_type_id
+        for _pool_id, group_gpu_type_ids in groups
+        for gpu_type_id in group_gpu_type_ids
+    )
+    try:
+        supply = client.get_gpu_supply(
+            gpu_type_ids,
+            data_center_id=data_center_id,
+            gpu_count=config.runtime.runpod.gpu_count,
+            allowed_cuda_versions=config.runtime.runpod.allowed_cuda_versions,
+        )
+    except (QuadraError, KeyError, TypeError) as exc:
+        logger.debug("RunPod GPU supply lookup failed: %s", exc)
+        return unknown
+    if not isinstance(supply, dict):
+        return unknown
+
+    return tuple(
+        GpuPoolSupply(
+            pool_id=pool_id,
+            status=aggregate_gpu_supply_status(
+                [supply.get(gpu_type_id) for gpu_type_id in group_gpu_type_ids]
+            ),
+        )
+        for pool_id, group_gpu_type_ids in groups
+    )
+
+
+def format_gpu_supply_chip(pool: GpuPoolSupply) -> str:
+    color_by_status = {
+        "HIGH": "green",
+        "MEDIUM": "yellow",
+        "LOW": "red",
+        "UNAVAILABLE": "red",
+        "UNKNOWN": "bright_black",
+    }
+    color = color_by_status.get(pool.status, "bright_black")
+    return click.style(
+        f"● {pool.pool_id} {pool.status}",
+        fg=color,
+        bold=pool.status in {"LOW", "UNAVAILABLE"},
+    )
+
+
+def report_gpu_supply_dashboard(
+    supply: tuple[GpuPoolSupply, ...],
+    *,
+    data_center_id: str | None,
+) -> None:
+    location = data_center_id or "all regions"
+    chips = "  ".join(format_gpu_supply_chip(pool) for pool in supply)
+    click.echo(f"[quadra] GPU supply · {location}  {chips}")
+
+
 def load_last_run(config: ProjectConfig) -> RunReference:
     if not config.last_run_file.exists():
         raise QuadraError(
@@ -3476,6 +3737,8 @@ def stream_logs(config: ProjectConfig, reference: RunReference, *, follow: bool)
     queue_timeout_seconds = runpod_queue_timeout_seconds()
     all_exited_threshold_seconds = runpod_all_exited_threshold_seconds()
     all_exited_since: float | None = None
+    gpu_supply = unknown_gpu_pool_supply(config)
+    last_gpu_supply_refresh_at: float | None = None
 
     while True:
         saw_output_this_iteration = False
@@ -3539,14 +3802,25 @@ def stream_logs(config: ProjectConfig, reference: RunReference, *, follow: bool)
                 int((datetime.now(timezone.utc) - submitted_at).total_seconds()),
             )
 
+        now_monotonic = time.monotonic()
         queue_diagnostics = EndpointQueueDiagnostics()
         if status == "IN_QUEUE":
             queue_diagnostics = get_endpoint_queue_diagnostics(
                 client,
                 reference.endpoint_id,
             )
+            if (
+                last_gpu_supply_refresh_at is None
+                or now_monotonic - last_gpu_supply_refresh_at
+                >= GPU_SUPPLY_REFRESH_INTERVAL_SECONDS
+            ):
+                gpu_supply = get_gpu_pool_supply(
+                    client,
+                    config,
+                    data_center_id=volume.data_center_id,
+                )
+                last_gpu_supply_refresh_at = now_monotonic
 
-        now_monotonic = time.monotonic()
         should_report = False
         if status != last_reported_status:
             should_report = True
@@ -3571,6 +3845,11 @@ def stream_logs(config: ProjectConfig, reference: RunReference, *, follow: bool)
                 elapsed_seconds=elapsed_seconds,
                 detail=queue_diagnostics.progress_summary if status == "IN_QUEUE" else None,
             )
+            if status == "IN_QUEUE":
+                report_gpu_supply_dashboard(
+                    gpu_supply,
+                    data_center_id=volume.data_center_id,
+                )
             last_reported_status = status
             last_progress_at = now_monotonic
 
@@ -3872,10 +4151,41 @@ def submit(command_parts: tuple[str, ...]) -> None:
 
 @cli.command(context_settings={"ignore_unknown_options": True})
 @click.argument("command_parts", nargs=-1, required=True, type=click.UNPROCESSED)
-def run(command_parts: tuple[str, ...]) -> None:
+@click.option(
+    "--fork",
+    "fork_urls",
+    multiple=True,
+    help=(
+        "Clone a fork URL into src/libs and wire it as a local editable dependency "
+        "before running. Repeatable. Place before the command."
+    ),
+)
+@click.option(
+    "--fork-package",
+    "fork_packages",
+    multiple=True,
+    help=(
+        "Package name for the corresponding --fork when it differs from the repo name. "
+        "Repeatable; paired with --fork by position."
+    ),
+)
+def run(
+    command_parts: tuple[str, ...],
+    fork_urls: tuple[str, ...],
+    fork_packages: tuple[str, ...],
+) -> None:
     """Sync, run a command remotely, stream logs, and pull artifacts."""
     try:
         config = load_runnable_project()
+        if len(fork_packages) > len(fork_urls):
+            raise QuadraError(
+                "More --fork-package values than --fork URLs were provided."
+            )
+        fork_specs: list[tuple[str, str | None]] = [
+            (fork_url, fork_packages[index] if index < len(fork_packages) else None)
+            for index, fork_url in enumerate(fork_urls)
+        ]
+        apply_fork_specs(config, fork_specs)
         code = run_command(config, command_parts)
     except QuadraError as exc:
         raise click.ClickException(str(exc)) from exc
@@ -3895,18 +4205,33 @@ def fork(fork_url: str, package_name: str | None) -> None:
     """Clone a fork into src/libs and use it from the experiment project."""
     try:
         config = load_project()
-        destination, pyproject_path, resolved_package_name = clone_fork_into_project(
-            config,
-            fork_url=fork_url,
-            package_name=package_name,
+        destination, pyproject_path, resolved_package_name, wired, skip_clone = (
+            clone_fork_into_project(
+                config,
+                fork_url=fork_url,
+                package_name=package_name,
+            )
         )
     except QuadraError as exc:
         raise click.ClickException(str(exc)) from exc
 
-    click.echo(f"cloned {fork_url}")
+    if skip_clone:
+        click.echo(
+            f"warning: library destination already exists, skipping clone: "
+            f"{destination}"
+        )
+    else:
+        click.echo(f"cloned {fork_url}")
     click.echo(f"library: {destination}")
     click.echo(f"package: {resolved_package_name}")
-    click.echo(f"updated: {pyproject_path}")
+    if wired:
+        click.echo(f"updated: {pyproject_path}")
+    else:
+        click.echo(
+            "note: experiment pyproject has no [project] table; fork cloned "
+            "but not wired as a uv dependency. Wire it via your command or "
+            "setup_command (e.g. PYTHONPATH)."
+        )
 
 
 @cli.command()

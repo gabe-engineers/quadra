@@ -357,6 +357,33 @@ class PollingFakeRunpodClient(FakeRunpodClient):
         ]
 
 
+class SupplyPollingFakeRunpodClient(PollingFakeRunpodClient):
+    def __init__(self, s3: FakeS3Client, *, data_center_id: str = "US-IL-1") -> None:
+        super().__init__(s3, data_center_id=data_center_id)
+        self.supply_calls: list[dict[str, object]] = []
+
+    def get_gpu_supply(
+        self,
+        gpu_type_ids: tuple[str, ...],
+        *,
+        data_center_id: str | None,
+        gpu_count: int,
+        allowed_cuda_versions: tuple[str, ...],
+    ) -> dict[str, str | None]:
+        self.supply_calls.append(
+            {
+                "gpu_type_ids": gpu_type_ids,
+                "data_center_id": data_center_id,
+                "gpu_count": gpu_count,
+                "allowed_cuda_versions": allowed_cuda_versions,
+            }
+        )
+        return {
+            gpu_type_id: "Low" if index < 2 else None
+            for index, gpu_type_id in enumerate(gpu_type_ids)
+        }
+
+
 class BootstrapLoggingPollingFakeRunpodClient(PollingFakeRunpodClient):
     def run_job(self, endpoint_id: str, request_input: dict[str, object]) -> dict[str, object]:
         response = super().run_job(endpoint_id, request_input)
@@ -570,6 +597,29 @@ class QuadraCLITestCase(unittest.TestCase):
                 "gpuCount": 1,
                 "executionTimeoutMs": 600000,
             },
+        )
+
+    def test_build_endpoint_create_body_expands_multiple_gpu_pools(self) -> None:
+        body = build_endpoint_create_body(
+            name="quadra-bonsai",
+            template_id="tpl-123",
+            gpu_ids="BLACKWELL_180,HOPPER_141",
+            network_volume_id="nv-123",
+            locations=None,
+            idle_timeout=5,
+            scaler_type="QUEUE_DELAY",
+            scaler_value=4,
+            workers_min=0,
+            workers_max=1,
+            flashboot=False,
+            allowed_cuda_versions=(),
+            gpu_count=1,
+            timeout_seconds=600,
+        )
+
+        self.assertEqual(
+            body.to_dict()["gpuTypeIds"],
+            ["NVIDIA B200", "NVIDIA H200", "NVIDIA H200 NVL"],
         )
 
     def test_runpod_client_create_endpoint_uses_rest_create_timeout(self) -> None:
@@ -799,6 +849,72 @@ class QuadraCLITestCase(unittest.TestCase):
             job = client.get_job("ep-123", "job-123")
 
         self.assertEqual(job, {"id": "job-123", "status": "IN_QUEUE"})
+
+    def test_runpod_client_queries_gpu_supply_for_serverless_inventory(self) -> None:
+        client = RunpodClient("rp-key")
+
+        def fake_request(
+            method: str,
+            url: str,
+            *,
+            params: dict[str, str],
+            headers: dict[str, str],
+            json: dict[str, object],
+            timeout: int,
+        ) -> object:
+            self.assertEqual(method, "POST")
+            self.assertEqual(url, "https://api.runpod.io/graphql")
+            self.assertEqual(params, {"api_key": "rp-key"})
+            self.assertEqual(headers, {"Content-Type": "application/json"})
+            self.assertEqual(timeout, 10)
+            variables = json["variables"]
+            self.assertEqual(
+                variables,
+                {
+                    "priceInput": {
+                        "gpuCount": 1,
+                        "includeAiApi": True,
+                        "dataCenterId": "EU-RO-1",
+                        "allowedCudaVersions": ["13.0"],
+                    }
+                },
+            )
+            return type(
+                "Response",
+                (),
+                {
+                    "status_code": HTTPStatus.OK,
+                    "text": "",
+                    "reason_phrase": "OK",
+                    "json": lambda self: {
+                        "data": {
+                            "gpuTypes": [
+                                {
+                                    "id": "NVIDIA RTX PRO 6000 Blackwell Server Edition",
+                                    "lowestPrice": {"stockStatus": "Low"},
+                                },
+                                {
+                                    "id": "NVIDIA L4",
+                                    "lowestPrice": {"stockStatus": "High"},
+                                },
+                            ]
+                        }
+                    },
+                },
+            )()
+
+        with patch("quadra.cli.httpx.request", side_effect=fake_request):
+            supply = client.get_gpu_supply(
+                ("NVIDIA RTX PRO 6000 Blackwell Server Edition",),
+                data_center_id="EU-RO-1",
+                gpu_count=1,
+                allowed_cuda_versions=("13.0",),
+            )
+
+        self.assertEqual(
+            supply,
+            {"NVIDIA RTX PRO 6000 Blackwell Server Edition": "Low"},
+        )
 
     def test_runpod_client_uses_rest_template_create(self) -> None:
         client = RunpodClient("rp-key")
@@ -1141,6 +1257,28 @@ class QuadraCLITestCase(unittest.TestCase):
                 self.assertIn('name = "bonsai"', Path("quadra.toml").read_text(encoding="utf-8"))
                 self.assertEqual(Path("README.md").read_text(encoding="utf-8"), "# bonsai\n")
 
+    def test_project_config_accepts_gpu_ids_list(self) -> None:
+        with self.runner.isolated_filesystem():
+            result = self.runner.invoke(cli, ["init", "bonsai"])
+            self.assertEqual(result.exit_code, 0, result.output)
+
+            config_path = Path("bonsai/quadra.toml")
+            config_path.write_text(
+                config_path.read_text(encoding="utf-8").replace(
+                    'gpu_ids = "AMPERE_16"',
+                    'gpu_ids = ["BLACKWELL_180", "HOPPER_141"]',
+                ),
+                encoding="utf-8",
+            )
+
+            with chdir("bonsai"):
+                config = load_project()
+
+            self.assertEqual(
+                config.runtime.runpod.gpu_ids,
+                "BLACKWELL_180,HOPPER_141",
+            )
+
     def test_global_config_supplies_shared_runpod_backend(self) -> None:
         with self.runner.isolated_filesystem():
             global_config = Path("global-quadra.toml").resolve()
@@ -1427,13 +1565,13 @@ class QuadraCLITestCase(unittest.TestCase):
                 pyproject,
             )
 
-    def test_fork_refuses_to_overwrite_existing_lib_checkout(self) -> None:
+    def test_fork_skips_clone_with_warning_when_lib_destination_already_populated(self) -> None:
         with self.runner.isolated_filesystem():
             self.assertEqual(self.runner.invoke(cli, ["init", "bonsai"]).exit_code, 0)
 
             with chdir("bonsai"):
                 lib_dir = Path("src/libs/custom-lib")
-                lib_dir.mkdir()
+                lib_dir.mkdir(parents=True)
                 (lib_dir / "README.md").write_text("keep me\n", encoding="utf-8")
                 with patch("quadra.cli.subprocess.run") as run:
                     result = self.runner.invoke(
@@ -1441,9 +1579,114 @@ class QuadraCLITestCase(unittest.TestCase):
                         ["fork", "https://github.com/acme/custom-lib.git"],
                     )
 
-            self.assertNotEqual(result.exit_code, 0)
-            self.assertIn("already exists and is not empty", result.output)
+                self.assertEqual(result.exit_code, 0, result.output)
+                run.assert_not_called()
+                self.assertIn("skipping clone", result.output)
+                self.assertIn("package: custom-lib", result.output)
+                self.assertTrue((lib_dir / "README.md").exists())
+
+    def test_fork_clones_without_wiring_when_experiment_pyproject_lacks_project_table(self) -> None:
+        with self.runner.isolated_filesystem():
+            self.assertEqual(self.runner.invoke(cli, ["init", "bonsai"]).exit_code, 0)
+
+            with chdir("bonsai"):
+                experiment_pyproject = Path("src/experiment/pyproject.toml")
+                experiment_pyproject.write_text(
+                    '[tool.ruff]\nline-length = 119\n',
+                    encoding="utf-8",
+                )
+                with patch("quadra.cli.subprocess.run") as run:
+                    result = self.runner.invoke(
+                        cli,
+                        ["fork", "https://github.com/acme/transformers.git"],
+                    )
+
+                pyproject_text = experiment_pyproject.read_text(encoding="utf-8")
+
+            self.assertEqual(result.exit_code, 0, result.output)
+            run.assert_called_once()
+            self.assertIn("package: transformers", result.output)
+            self.assertIn("no [project] table", result.output)
+            self.assertNotIn("updated:", result.output)
+            self.assertNotIn("[tool.uv.sources]", pyproject_text)
+            self.assertNotIn("dependencies", pyproject_text)
+
+    def test_run_with_fork_clones_without_wiring_for_non_pep621_experiment(self) -> None:
+        with self.runner.isolated_filesystem():
+            global_config = Path("global-quadra.toml").resolve()
+            self._write_global_config(global_config)
+            project_root = Path("diffusers")
+            project_root.mkdir()
+            (project_root / "pyproject.toml").write_text(
+                '[tool.ruff]\nline-length = 119\n',
+                encoding="utf-8",
+            )
+            (project_root / "main.py").write_text("print('ok')\n", encoding="utf-8")
+            fake_s3 = FakeS3Client()
+            fake_client = FakeRunpodClient(fake_s3)
+            fake_client.volume["name"] = "quadra-dev"
+
+            def fake_clone(args, **kwargs):
+                dest = Path(args[-1])
+                dest.mkdir(parents=True, exist_ok=True)
+                (dest / "transformers.py").write_text("# local fork\n", encoding="utf-8")
+                return None
+
+            with patch.dict(os.environ, {"QUADRA_CONFIG": str(global_config)}):
+                with chdir(project_root):
+                    with patch("quadra.cli.subprocess.run", side_effect=fake_clone):
+                        with patch("quadra.cli.load_runpod_client", return_value=fake_client):
+                            with patch("quadra.cli.build_s3_client", return_value=fake_s3):
+                                result = self.runner.invoke(
+                                    cli,
+                                    ["run", "--fork", "https://github.com/me/transformers.git", "pytest"],
+                                )
+
+            self.assertEqual(result.exit_code, 0, result.output)
+            self.assertIn("no [project] table", result.output)
+            pyproject = (project_root / "pyproject.toml").read_text(encoding="utf-8")
+            self.assertNotIn("[tool.uv.sources]", pyproject)
+            self.assertEqual(
+                fake_client.submissions[0]["payload"]["quadra"]["command"],
+                "pytest",
+            )
+            self.assertIn(
+                "projects/diffusers/src/libs/transformers/transformers.py",
+                fake_s3.objects,
+            )
+
+    def test_run_with_fork_skips_clone_when_destination_already_populated(self) -> None:
+        with self.runner.isolated_filesystem():
+            global_config = Path("global-quadra.toml").resolve()
+            self._write_global_config(global_config)
+            project_root = Path("diffusers")
+            project_root.mkdir()
+            (project_root / "pyproject.toml").write_text(
+                '[project]\nname = "diffusers"\nversion = "0.1.0"\n',
+                encoding="utf-8",
+            )
+            (project_root / "main.py").write_text("print('ok')\n", encoding="utf-8")
+            lib_dir = project_root / "src" / "libs" / "gemlite"
+            lib_dir.mkdir(parents=True)
+            (lib_dir / "README.md").write_text("keep me\n", encoding="utf-8")
+            fake_s3 = FakeS3Client()
+            fake_client = FakeRunpodClient(fake_s3)
+            fake_client.volume["name"] = "quadra-dev"
+
+            with patch.dict(os.environ, {"QUADRA_CONFIG": str(global_config)}):
+                with chdir(project_root):
+                    with patch("quadra.cli.subprocess.run") as run:
+                        with patch("quadra.cli.load_runpod_client", return_value=fake_client):
+                            with patch("quadra.cli.build_s3_client", return_value=fake_s3):
+                                result = self.runner.invoke(
+                                    cli,
+                                    ["run", "--fork", "https://github.com/gabe-engineers/gemlite.git", "pytest"],
+                                )
+
+            self.assertEqual(result.exit_code, 0, result.output)
             run.assert_not_called()
+            self.assertIn("skipping clone", result.output)
+            self.assertIn("package: gemlite", result.output)
 
     def test_sync_errors_when_volume_datacenter_has_no_s3_support(self) -> None:
         with self.runner.isolated_filesystem():
@@ -2112,6 +2355,152 @@ class QuadraCLITestCase(unittest.TestCase):
                 fake_client.submissions[0]["payload"]["quadra"]["setup_command"],
             )
 
+    def _write_global_config(self, path: Path) -> None:
+        path.write_text(
+            "\n".join(
+                [
+                    "[runpod.network_volume]",
+                    'name = "quadra-dev"',
+                    "",
+                    "[runpod.serverless]",
+                    'endpoint_name = "quadra-dev"',
+                    "",
+                    "[runpod.template]",
+                    'name = "quadra-dev-serverless-worker"',
+                ]
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+    def test_run_with_fork_clones_and_wires_dependency_in_ephemeral_project(self) -> None:
+        with self.runner.isolated_filesystem():
+            global_config = Path("global-quadra.toml").resolve()
+            self._write_global_config(global_config)
+            project_root = Path("diffusers")
+            project_root.mkdir()
+            (project_root / "pyproject.toml").write_text(
+                '[project]\nname = "diffusers"\nversion = "0.1.0"\n',
+                encoding="utf-8",
+            )
+            (project_root / "main.py").write_text("print('ok')\n", encoding="utf-8")
+            fake_s3 = FakeS3Client()
+            fake_client = FakeRunpodClient(fake_s3)
+            fake_client.volume["name"] = "quadra-dev"
+
+            def fake_clone(args, **kwargs):
+                dest = Path(args[-1])
+                dest.mkdir(parents=True, exist_ok=True)
+                (dest / "transformers.py").write_text("# local fork\n", encoding="utf-8")
+                return None
+
+            with patch.dict(os.environ, {"QUADRA_CONFIG": str(global_config)}):
+                with chdir(project_root):
+                    with patch("quadra.cli.subprocess.run", side_effect=fake_clone):
+                        with patch("quadra.cli.load_runpod_client", return_value=fake_client):
+                            with patch("quadra.cli.build_s3_client", return_value=fake_s3):
+                                result = self.runner.invoke(
+                                    cli,
+                                    ["run", "--fork", "https://github.com/me/transformers.git", "pytest"],
+                                )
+
+            self.assertEqual(result.exit_code, 0, result.output)
+            self.assertIn("forked https://github.com/me/transformers.git", result.output)
+            self.assertIn("package: transformers", result.output)
+            pyproject = (project_root / "pyproject.toml").read_text(encoding="utf-8")
+            self.assertIn('"transformers",', pyproject)
+            self.assertIn(
+                '"transformers" = { path = "src/libs/transformers", editable = true }',
+                pyproject,
+            )
+            self.assertEqual(
+                fake_client.submissions[0]["payload"]["quadra"]["command"],
+                "pytest",
+            )
+            self.assertIn(
+                "projects/diffusers/src/libs/transformers/transformers.py",
+                fake_s3.objects,
+            )
+
+    def test_run_with_fork_package_pairs_by_position(self) -> None:
+        with self.runner.isolated_filesystem():
+            global_config = Path("global-quadra.toml").resolve()
+            self._write_global_config(global_config)
+            project_root = Path("diffusers")
+            project_root.mkdir()
+            (project_root / "pyproject.toml").write_text(
+                '[project]\nname = "diffusers"\nversion = "0.1.0"\n',
+                encoding="utf-8",
+            )
+            fake_s3 = FakeS3Client()
+            fake_client = FakeRunpodClient(fake_s3)
+            fake_client.volume["name"] = "quadra-dev"
+
+            with patch.dict(os.environ, {"QUADRA_CONFIG": str(global_config)}):
+                with chdir(project_root):
+                    with patch("quadra.cli.subprocess.run"):
+                        with patch("quadra.cli.load_runpod_client", return_value=fake_client):
+                            with patch("quadra.cli.build_s3_client", return_value=fake_s3):
+                                result = self.runner.invoke(
+                                    cli,
+                                    [
+                                        "run",
+                                        "--fork",
+                                        "https://github.com/me/transformers-fork.git",
+                                        "--fork-package",
+                                        "transformers",
+                                        "pytest",
+                                    ],
+                                )
+
+            self.assertEqual(result.exit_code, 0, result.output)
+            self.assertIn("package: transformers", result.output)
+            pyproject = (project_root / "pyproject.toml").read_text(encoding="utf-8")
+            self.assertIn('"transformers",', pyproject)
+            self.assertIn(
+                '"transformers" = { path = "src/libs/transformers-fork", editable = true }',
+                pyproject,
+            )
+
+    def test_run_rejects_more_fork_packages_than_fork_urls(self) -> None:
+        with self.runner.isolated_filesystem():
+            global_config = Path("global-quadra.toml").resolve()
+            self._write_global_config(global_config)
+            project_root = Path("diffusers")
+            project_root.mkdir()
+            (project_root / "pyproject.toml").write_text(
+                '[project]\nname = "diffusers"\nversion = "0.1.0"\n',
+                encoding="utf-8",
+            )
+            fake_s3 = FakeS3Client()
+            fake_client = FakeRunpodClient(fake_s3)
+            fake_client.volume["name"] = "quadra-dev"
+
+            with patch.dict(os.environ, {"QUADRA_CONFIG": str(global_config)}):
+                with chdir(project_root):
+                    with patch("quadra.cli.subprocess.run"):
+                        with patch("quadra.cli.load_runpod_client", return_value=fake_client):
+                            with patch("quadra.cli.build_s3_client", return_value=fake_s3):
+                                result = self.runner.invoke(
+                                    cli,
+                                    [
+                                        "run",
+                                        "--fork",
+                                        "https://github.com/me/transformers.git",
+                                        "--fork-package",
+                                        "transformers",
+                                        "--fork-package",
+                                        "extra",
+                                        "pytest",
+                                    ],
+                                )
+
+            self.assertNotEqual(result.exit_code, 0)
+            self.assertIn(
+                "More --fork-package values than --fork URLs were provided.",
+                result.output,
+            )
+
     def test_smoke_reports_polling_progress(self) -> None:
         with self.runner.isolated_filesystem():
             init_result = self.runner.invoke(cli, ["init", "bonsai"])
@@ -2140,6 +2529,38 @@ class QuadraCLITestCase(unittest.TestCase):
             )
             self.assertIn("[quadra] smoke: completed", result.output)
             self.assertIn("pulling artifacts for", result.output)
+
+    def test_smoke_reports_gpu_pool_supply_dashboard_while_queued(self) -> None:
+        with self.runner.isolated_filesystem():
+            init_result = self.runner.invoke(cli, ["init", "bonsai"])
+            self.assertEqual(init_result.exit_code, 0, init_result.output)
+
+            fake_s3 = FakeS3Client()
+            fake_client = SupplyPollingFakeRunpodClient(fake_s3)
+
+            with chdir("bonsai"):
+                with patch("quadra.cli.load_runpod_client", return_value=fake_client):
+                    with patch("quadra.cli.build_s3_client", return_value=fake_s3):
+                        with patch("quadra.cli.time.sleep", return_value=None):
+                            result = self.runner.invoke(cli, ["smoke"])
+
+            self.assertEqual(result.exit_code, 0, result.output)
+            self.assertIn("[quadra] GPU supply · US-IL-1", result.output)
+            self.assertIn("● AMPERE_16 LOW", result.output)
+            self.assertEqual(len(fake_client.supply_calls), 1)
+            self.assertEqual(
+                fake_client.supply_calls[0]["data_center_id"],
+                "US-IL-1",
+            )
+
+    def test_gpu_supply_chip_uses_status_color(self) -> None:
+        from quadra.cli import GpuPoolSupply, format_gpu_supply_chip
+
+        low = format_gpu_supply_chip(GpuPoolSupply("BLACKWELL_96", "LOW"))
+        high = format_gpu_supply_chip(GpuPoolSupply("AMPERE_16", "HIGH"))
+
+        self.assertIn("\x1b[31m", low)
+        self.assertIn("\x1b[32m", high)
 
     def test_smoke_pulls_core_logs_without_listing_when_manifest_is_missing(self) -> None:
         with self.runner.isolated_filesystem():
