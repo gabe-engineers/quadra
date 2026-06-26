@@ -65,11 +65,18 @@ quadra init
   when the package name differs from the repo name. This lets a library checkout be
   the experiment and test it against local versions of its dependencies, e.g.
   `quadra run --fork https://github.com/me/transformers "pytest"`.
+  Pass `--setup-command <command>` to replace the configured setup command for one
+  run, or `--no-setup` to disable setup for that run.
 - `quadra submit <workflow>` submits a workflow job to the configured Serverless endpoint.
+  It also accepts the per-run `--setup-command <command>` and `--no-setup` options.
 - `quadra fork <fork_url>` clones a fork into `src/libs/<repo>/` and updates
   `src/experiment/pyproject.toml` to use that local checkout as an editable uv source.
   Pass `--package <name>` when the Python package name differs from the fork repo name.
-- `quadra logs` streams logs for the most recently submitted run.
+- `quadra logs` fetches logs for the most recently submitted run once by default.
+  Pass `--follow` to keep polling until the job completes.
+- Interactive `run` and `smoke` sessions show a live status dashboard while
+  preserving streaming worker output. Use `--plain` or set `QUADRA_NO_TUI=1`
+  for sequential output.
 - `quadra pull [run_id] [destination]` downloads a completed run into `runs/<run_id>/`.
 - `quadra smoke` runs the full sync-submit-logs-pull loop for the default workflow.
   In the default scaffold, `smoke` runs `python main.py`.
@@ -84,7 +91,7 @@ Quadra targets RunPod Serverless only.
 - The remote project directory defaults to `/runpod-volume/projects/<project_name>`.
 - The first `submit` creates the configured RunPod template and endpoint if they do not already exist.
 - `submit` sends a workflow job to a persistent Serverless endpoint.
-- `logs` uses the saved local run reference to follow the latest submission.
+- `logs` uses the saved local run reference to read or follow the latest submission.
 - `pull` downloads the remote run directory back into the local project.
 
 Your network volume must live in a RunPod datacenter that supports the S3-compatible API. Quadra checks this up front and fails early when the selected volume cannot be used for sync and artifact pull.

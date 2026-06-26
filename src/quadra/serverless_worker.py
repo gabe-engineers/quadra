@@ -189,6 +189,8 @@ def handler(job: dict[str, Any]) -> Generator[dict[str, str], None, dict[str, An
 
     run_dir.mkdir(parents=True, exist_ok=True)
     artifacts_dir.mkdir(parents=True, exist_ok=True)
+    stdout_path.touch()
+    stderr_path.touch()
 
     env = os.environ.copy()
     env.update({str(key): str(value) for key, value in (spec.get("env") or {}).items()})

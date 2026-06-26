@@ -441,6 +441,33 @@ class ManifestlessPollingFakeRunpodClient(PollingFakeRunpodClient):
         )
 
 
+class StaleManifestFakeRunpodClient(FakeRunpodClient):
+    def write_run_outputs(
+        self,
+        run_prefix: str,
+        *,
+        run_id: str,
+        workflow: str,
+        include_manifest: bool = True,
+    ) -> None:
+        super().write_run_outputs(
+            run_prefix,
+            run_id=run_id,
+            workflow=workflow,
+            include_manifest=include_manifest,
+        )
+        self.s3.objects[posixpath.join(run_prefix, "run-manifest.json")] = json.dumps(
+            {
+                "run_id": run_id,
+                "status": "running",
+                "files": [
+                    "artifacts/result.txt",
+                    "status.json",
+                ],
+            }
+        ).encode("utf-8")
+
+
 class UnhealthyQueuedFakeRunpodClient(FakeRunpodClient):
     def run_job(self, endpoint_id: str, request_input: dict[str, object]) -> dict[str, object]:
         del request_input
@@ -2310,6 +2337,76 @@ class QuadraCLITestCase(unittest.TestCase):
             self.assertNotEqual(result.exit_code, 0)
             self.assertIn("Run `quadra sync` first", result.output)
 
+    def test_submit_setup_override_and_no_setup_apply_to_one_run_only(self) -> None:
+        with self.runner.isolated_filesystem():
+            self.assertEqual(self.runner.invoke(cli, ["init", "bonsai"]).exit_code, 0)
+            fake_s3 = FakeS3Client()
+            fake_client = FakeRunpodClient(fake_s3)
+
+            with chdir("bonsai"):
+                config_path = Path("quadra.toml")
+                original_config = config_path.read_text(encoding="utf-8")
+                with patch("quadra.cli.load_runpod_client", return_value=fake_client):
+                    with patch("quadra.cli.build_s3_client", return_value=fake_s3):
+                        sync_result = self.runner.invoke(cli, ["sync"])
+                        override_result = self.runner.invoke(
+                            cli,
+                            [
+                                "submit",
+                                "--setup-command",
+                                'uv pip install -e ".[test]"',
+                                "smoke",
+                            ],
+                        )
+                        no_setup_result = self.runner.invoke(
+                            cli,
+                            ["submit", "--no-setup", "smoke"],
+                        )
+                        default_result = self.runner.invoke(cli, ["submit", "smoke"])
+
+                self.assertEqual(
+                    config_path.read_text(encoding="utf-8"),
+                    original_config,
+                )
+
+            self.assertEqual(sync_result.exit_code, 0, sync_result.output)
+            self.assertEqual(override_result.exit_code, 0, override_result.output)
+            self.assertEqual(no_setup_result.exit_code, 0, no_setup_result.output)
+            self.assertEqual(default_result.exit_code, 0, default_result.output)
+            self.assertEqual(
+                fake_client.submissions[0]["payload"]["quadra"]["setup_command"],
+                'uv pip install -e ".[test]"',
+            )
+            self.assertIsNone(
+                fake_client.submissions[1]["payload"]["quadra"]["setup_command"]
+            )
+            self.assertIn(
+                'cd "/runpod-volume/projects/bonsai/src/experiment" && "$(command -v uv)" sync',
+                fake_client.submissions[2]["payload"]["quadra"]["setup_command"],
+            )
+
+    def test_setup_command_and_no_setup_are_mutually_exclusive(self) -> None:
+        with self.runner.isolated_filesystem():
+            self.assertEqual(self.runner.invoke(cli, ["init", "bonsai"]).exit_code, 0)
+
+            with chdir("bonsai"):
+                result = self.runner.invoke(
+                    cli,
+                    [
+                        "submit",
+                        "--setup-command",
+                        "python -m pip install pytest",
+                        "--no-setup",
+                        "smoke",
+                    ],
+                )
+
+            self.assertNotEqual(result.exit_code, 0)
+            self.assertIn(
+                "--setup-command and --no-setup cannot be used together",
+                result.output,
+            )
+
     def test_sync_submit_logs_and_pull_flow(self) -> None:
         with self.runner.isolated_filesystem():
             init_result = self.runner.invoke(cli, ["init", "bonsai"])
@@ -2409,6 +2506,34 @@ class QuadraCLITestCase(unittest.TestCase):
                             "smoke artifact\n",
                         )
 
+    def test_logs_default_is_one_shot_and_plain(self) -> None:
+        with self.runner.isolated_filesystem():
+            init_result = self.runner.invoke(cli, ["init", "bonsai"])
+            self.assertEqual(init_result.exit_code, 0, init_result.output)
+
+            fake_s3 = FakeS3Client()
+            fake_client = PollingFakeRunpodClient(fake_s3)
+
+            with chdir("bonsai"):
+                with patch("quadra.cli.load_runpod_client", return_value=fake_client):
+                    with patch("quadra.cli.build_s3_client", return_value=fake_s3):
+                        sync_result = self.runner.invoke(cli, ["sync"])
+                        self.assertEqual(sync_result.exit_code, 0, sync_result.output)
+                        submit_result = self.runner.invoke(cli, ["submit", "smoke"])
+                        self.assertEqual(submit_result.exit_code, 0, submit_result.output)
+                        with patch(
+                            "quadra.cli.supports_live_dashboard",
+                            return_value=True,
+                        ) as supports_live_dashboard:
+                            logs_result = self.runner.invoke(cli, ["logs"])
+
+            self.assertNotEqual(logs_result.exit_code, 0)
+            supports_live_dashboard.assert_not_called()
+            self.assertIn("[quadra] smoke: queued on RunPod", logs_result.output)
+            self.assertIn("status: IN_QUEUE", logs_result.output)
+            self.assertNotIn("Quadra run", logs_result.output)
+            self.assertNotIn("bonsai smoke remote", logs_result.output)
+
     def test_run_executes_named_workflow_in_quadra_project(self) -> None:
         with self.runner.isolated_filesystem():
             init_result = self.runner.invoke(cli, ["init", "bonsai"])
@@ -2436,6 +2561,57 @@ class QuadraCLITestCase(unittest.TestCase):
             self.assertIn("syncing bonsai -> /runpod-volume/projects/bonsai", result.output)
             self.assertIn("submitting smoke", result.output)
             self.assertIn("bonsai smoke remote", result.output)
+
+    def test_run_uses_live_dashboard_when_interactive(self) -> None:
+        with self.runner.isolated_filesystem():
+            init_result = self.runner.invoke(cli, ["init", "bonsai"])
+            self.assertEqual(init_result.exit_code, 0, init_result.output)
+
+            fake_s3 = FakeS3Client()
+            fake_client = SupplyPollingFakeRunpodClient(fake_s3)
+
+            with chdir("bonsai"):
+                with patch("quadra.cli.load_runpod_client", return_value=fake_client):
+                    with patch("quadra.cli.build_s3_client", return_value=fake_s3):
+                        with patch(
+                            "quadra.cli.supports_live_dashboard",
+                            return_value=True,
+                        ):
+                            with patch("quadra.cli.time.sleep", return_value=None):
+                                result = self.runner.invoke(cli, ["run", "smoke"])
+
+            self.assertEqual(result.exit_code, 0, result.output)
+            self.assertIn("Quadra run", result.output)
+            self.assertIn("Workflow", result.output)
+            self.assertIn("AMPERE_16 LOW", result.output)
+            self.assertIn("bonsai smoke remote", result.output)
+            self.assertIn("pulling artifacts for", result.output)
+
+    def test_run_setup_command_overrides_configured_setup(self) -> None:
+        with self.runner.isolated_filesystem():
+            init_result = self.runner.invoke(cli, ["init", "bonsai"])
+            self.assertEqual(init_result.exit_code, 0, init_result.output)
+            fake_s3 = FakeS3Client()
+            fake_client = FakeRunpodClient(fake_s3)
+
+            with chdir("bonsai"):
+                with patch("quadra.cli.load_runpod_client", return_value=fake_client):
+                    with patch("quadra.cli.build_s3_client", return_value=fake_s3):
+                        result = self.runner.invoke(
+                            cli,
+                            [
+                                "run",
+                                "--setup-command",
+                                'uv pip install -e ".[test]"',
+                                "smoke",
+                            ],
+                        )
+
+            self.assertEqual(result.exit_code, 0, result.output)
+            self.assertEqual(
+                fake_client.submissions[0]["payload"]["quadra"]["setup_command"],
+                'uv pip install -e ".[test]"',
+            )
 
     def test_run_executes_plain_python_directory_with_global_config(self) -> None:
         with self.runner.isolated_filesystem():
@@ -2699,6 +2875,64 @@ class QuadraCLITestCase(unittest.TestCase):
                 "US-IL-1",
             )
 
+    def test_smoke_uses_live_dashboard_when_interactive(self) -> None:
+        with self.runner.isolated_filesystem():
+            init_result = self.runner.invoke(cli, ["init", "bonsai"])
+            self.assertEqual(init_result.exit_code, 0, init_result.output)
+
+            fake_s3 = FakeS3Client()
+            fake_client = SupplyPollingFakeRunpodClient(fake_s3)
+
+            with chdir("bonsai"):
+                with patch("quadra.cli.load_runpod_client", return_value=fake_client):
+                    with patch("quadra.cli.build_s3_client", return_value=fake_s3):
+                        with patch(
+                            "quadra.cli.supports_live_dashboard",
+                            return_value=True,
+                        ):
+                            with patch("quadra.cli.time.sleep", return_value=None):
+                                result = self.runner.invoke(cli, ["smoke"])
+
+            self.assertEqual(result.exit_code, 0, result.output)
+            self.assertIn("Quadra run", result.output)
+            self.assertIn("Workflow", result.output)
+            self.assertIn("AMPERE_16 LOW", result.output)
+            self.assertIn("bonsai smoke remote", result.output)
+            self.assertIn("completed", result.output)
+            self.assertNotIn("[quadra] smoke: queued on RunPod", result.output)
+
+    def test_smoke_plain_disables_live_dashboard(self) -> None:
+        with self.runner.isolated_filesystem():
+            init_result = self.runner.invoke(cli, ["init", "bonsai"])
+            self.assertEqual(init_result.exit_code, 0, init_result.output)
+
+            fake_s3 = FakeS3Client()
+            fake_client = PollingFakeRunpodClient(fake_s3)
+
+            with chdir("bonsai"):
+                with patch("quadra.cli.load_runpod_client", return_value=fake_client):
+                    with patch("quadra.cli.build_s3_client", return_value=fake_s3):
+                        with patch(
+                            "quadra.cli.supports_live_dashboard",
+                            return_value=True,
+                        ):
+                            with patch("quadra.cli.time.sleep", return_value=None):
+                                result = self.runner.invoke(cli, ["smoke", "--plain"])
+
+            self.assertEqual(result.exit_code, 0, result.output)
+            self.assertIn("[quadra] smoke: queued on RunPod", result.output)
+            self.assertNotIn("Quadra run", result.output)
+
+    def test_live_dashboard_is_disabled_for_no_follow_and_environment(self) -> None:
+        from quadra.cli import supports_live_dashboard
+
+        output = io.StringIO()
+        output.isatty = lambda: True  # type: ignore[attr-defined]
+        with patch("quadra.cli.click.get_text_stream", return_value=output):
+            self.assertFalse(supports_live_dashboard(follow=False))
+            with patch.dict(os.environ, {"QUADRA_NO_TUI": "1"}):
+                self.assertFalse(supports_live_dashboard(follow=True))
+
     def test_gpu_supply_chip_uses_status_color(self) -> None:
         from quadra.cli import GpuPoolSupply, format_gpu_supply_chip
 
@@ -2726,6 +2960,35 @@ class QuadraCLITestCase(unittest.TestCase):
             self.assertIn(
                 "remote run manifest is missing; downloaded core run logs only",
                 result.output,
+            )
+
+    def test_pull_fetches_core_logs_when_manifest_is_stale(self) -> None:
+        with self.runner.isolated_filesystem():
+            init_result = self.runner.invoke(cli, ["init", "bonsai"])
+            self.assertEqual(init_result.exit_code, 0, init_result.output)
+
+            fake_s3 = FakeS3Client()
+            fake_client = StaleManifestFakeRunpodClient(fake_s3)
+
+            with chdir("bonsai"):
+                with patch("quadra.cli.load_runpod_client", return_value=fake_client):
+                    with patch("quadra.cli.build_s3_client", return_value=fake_s3):
+                        sync_result = self.runner.invoke(cli, ["sync"])
+                        self.assertEqual(sync_result.exit_code, 0, sync_result.output)
+                        submit_result = self.runner.invoke(cli, ["submit", "smoke"])
+                        self.assertEqual(submit_result.exit_code, 0, submit_result.output)
+                        pull_result = self.runner.invoke(cli, ["pull"])
+
+            self.assertEqual(pull_result.exit_code, 0, pull_result.output)
+            pulled_path = Path(pull_result.output.strip().splitlines()[-1])
+            self.assertEqual(
+                (pulled_path / "stdout.log").read_text(encoding="utf-8"),
+                "bonsai smoke remote\n",
+            )
+            self.assertEqual((pulled_path / "stderr.log").read_text(encoding="utf-8"), "")
+            self.assertEqual(
+                (pulled_path / "artifacts" / "result.txt").read_text(encoding="utf-8"),
+                "smoke artifact\n",
             )
 
     def test_smoke_streams_worker_bootstrap_logs_while_queued(self) -> None:

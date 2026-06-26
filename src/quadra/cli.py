@@ -22,6 +22,11 @@ from typing import Any
 
 import click
 import httpx
+from rich.console import Console
+from rich.live import Live
+from rich.panel import Panel
+from rich.table import Table
+from rich.text import Text
 
 from quadra import __version__
 from quadra.errors import QuadraError
@@ -484,6 +489,201 @@ class EndpointQueueDiagnostics:
 class GpuPoolSupply:
     pool_id: str
     status: str
+
+
+class PlainRunRenderer:
+    interactive = False
+
+    def __enter__(self) -> PlainRunRenderer:
+        return self
+
+    def __exit__(self, *exc_info: object) -> None:
+        del exc_info
+
+    def announce_stream(self, label: str) -> None:
+        report_remote_stream(label)
+
+    def write(self, text: str, *, err: bool = False) -> None:
+        click.echo(text, nl=False, err=err)
+
+    def update(
+        self,
+        reference: RunReference,
+        status: str,
+        *,
+        has_remote_output: bool,
+        elapsed_seconds: int,
+        queue_diagnostics: EndpointQueueDiagnostics,
+        gpu_supply: tuple[GpuPoolSupply, ...],
+        data_center_id: str | None,
+    ) -> None:
+        report_poll_status(
+            reference,
+            status,
+            has_remote_output=has_remote_output,
+            elapsed_seconds=elapsed_seconds,
+            detail=(
+                queue_diagnostics.progress_summary if status == "IN_QUEUE" else None
+            ),
+        )
+        if status == "IN_QUEUE":
+            report_gpu_supply_dashboard(
+                gpu_supply,
+                data_center_id=data_center_id,
+            )
+
+
+class LiveRunRenderer:
+    interactive = True
+
+    def __init__(self, reference: RunReference) -> None:
+        self.reference = reference
+        self.console = Console(
+            file=click.get_text_stream("stdout"),
+            force_terminal=True,
+            color_system="auto",
+            no_color=os.getenv("NO_COLOR") is not None,
+        )
+        self._renderable = self._build_panel(
+            status="CONNECTING",
+            has_remote_output=False,
+            elapsed_seconds=0,
+            queue_diagnostics=EndpointQueueDiagnostics(),
+            gpu_supply=(),
+            data_center_id=None,
+        )
+        self.live = Live(
+            self._renderable,
+            console=self.console,
+            auto_refresh=False,
+            transient=False,
+            vertical_overflow="visible",
+        )
+
+    def __enter__(self) -> LiveRunRenderer:
+        self.live.start(refresh=True)
+        return self
+
+    def __exit__(self, *exc_info: object) -> None:
+        del exc_info
+        self.live.stop()
+
+    def announce_stream(self, label: str) -> None:
+        self.live.console.print(
+            Text(f"[quadra] streaming {label}...", style="dim")
+        )
+
+    def write(self, text: str, *, err: bool = False) -> None:
+        del err
+        self.live.console.print(Text.from_ansi(text), end="", soft_wrap=True)
+
+    def update(
+        self,
+        reference: RunReference,
+        status: str,
+        *,
+        has_remote_output: bool,
+        elapsed_seconds: int,
+        queue_diagnostics: EndpointQueueDiagnostics,
+        gpu_supply: tuple[GpuPoolSupply, ...],
+        data_center_id: str | None,
+    ) -> None:
+        self.reference = reference
+        self._renderable = self._build_panel(
+            status=status,
+            has_remote_output=has_remote_output,
+            elapsed_seconds=elapsed_seconds,
+            queue_diagnostics=queue_diagnostics,
+            gpu_supply=gpu_supply,
+            data_center_id=data_center_id,
+        )
+        self.live.update(self._renderable, refresh=True)
+
+    def _build_panel(
+        self,
+        *,
+        status: str,
+        has_remote_output: bool,
+        elapsed_seconds: int,
+        queue_diagnostics: EndpointQueueDiagnostics,
+        gpu_supply: tuple[GpuPoolSupply, ...],
+        data_center_id: str | None,
+    ) -> Panel:
+        status_style = {
+            "COMPLETED": "bold green",
+            "FAILED": "bold red",
+            "TIMED_OUT": "bold red",
+            "CANCELLED": "bold yellow",
+            "IN_PROGRESS": "bold cyan",
+            "RUNNING": "bold cyan",
+            "IN_QUEUE": "bold yellow",
+        }.get(status, "bold")
+        description = describe_job_status(
+            status,
+            has_remote_output=has_remote_output,
+        )
+
+        grid = Table.grid(expand=True, padding=(0, 1))
+        grid.add_column(style="dim", width=16, no_wrap=True)
+        grid.add_column(ratio=1)
+        grid.add_row("Workflow", self.reference.workflow)
+        grid.add_row(
+            "Status",
+            Text.assemble((description, status_style), ("  "), (status, "dim")),
+        )
+        grid.add_row("Elapsed", format_duration(elapsed_seconds))
+        if queue_diagnostics.progress_summary:
+            grid.add_row(
+                "Workers",
+                queue_diagnostics.progress_summary.removeprefix("workers: "),
+            )
+        if status == "IN_QUEUE" and gpu_supply:
+            supply_text = Text()
+            for index, pool in enumerate(gpu_supply):
+                if index:
+                    supply_text.append("   ")
+                color = {
+                    "HIGH": "green",
+                    "MEDIUM": "yellow",
+                    "LOW": "red",
+                    "UNAVAILABLE": "bold red",
+                    "UNKNOWN": "bright_black",
+                }.get(pool.status, "bright_black")
+                supply_text.append(f"● {pool.pool_id} {pool.status}", style=color)
+            location = data_center_id or "all regions"
+            grid.add_row(f"GPU · {location}", supply_text)
+        grid.add_row("Run", self.reference.run_id)
+        grid.add_row("Job", self.reference.job_id)
+        grid.add_row("Endpoint", self.reference.endpoint_id)
+        return Panel(grid, title="[bold]Quadra run[/bold]", border_style="bright_black")
+
+
+def supports_live_dashboard(*, follow: bool) -> bool:
+    if not follow or os.getenv("QUADRA_NO_TUI"):
+        return False
+    output = click.get_text_stream("stdout")
+    isatty = getattr(output, "isatty", None)
+    return bool(
+        callable(isatty)
+        and isatty()
+        and os.getenv("TERM") != "dumb"
+    )
+
+
+def create_run_renderer(
+    reference: RunReference,
+    *,
+    follow: bool,
+    interactive: bool | None,
+) -> PlainRunRenderer | LiveRunRenderer:
+    use_live = (
+        supports_live_dashboard(follow=follow)
+        if interactive is None
+        else interactive
+    )
+    if use_live and follow:
+        return LiveRunRenderer(reference)
+    return PlainRunRenderer()
 
 
 def supports_color(stream: Any | None = None) -> bool:
@@ -1809,6 +2009,8 @@ def render_project_worker_py() -> str:
 
             run_dir.mkdir(parents=True, exist_ok=True)
             artifacts_dir.mkdir(parents=True, exist_ok=True)
+            stdout_path.touch()
+            stderr_path.touch()
 
             env = os.environ.copy()
             env.update({str(key): str(value) for key, value in (spec.get("env") or {}).items()})
@@ -3243,12 +3445,16 @@ def resolve_run_command(
 
 
 def build_job_payload(
-    config: ProjectConfig, *, run_id: str, command: str, workflow: str
+    config: ProjectConfig,
+    *,
+    run_id: str,
+    command: str,
+    workflow: str,
+    setup_command: str | None,
 ) -> dict[str, Any]:
     project_dir = PurePosixPath(config.runtime.project_dir)
     experiment_dir = project_dir / config.paths.experiment
     run_dir = project_dir / config.paths.runs / run_id
-    setup_command = config.runtime.setup_command
     if setup_command:
         setup_command = expand_runtime_tokens(setup_command, config)
     return {
@@ -3566,7 +3772,10 @@ def load_last_run(config: ProjectConfig) -> RunReference:
 
 
 def submit_workflow(
-    config: ProjectConfig, command_parts: tuple[str, ...]
+    config: ProjectConfig,
+    command_parts: tuple[str, ...],
+    *,
+    setup_command: str | None,
 ) -> tuple[RunReference, EndpointHandle]:
     client = load_runpod_client(config)
     volume = resolve_runpod_volume(config, client, offer_create=True)
@@ -3576,7 +3785,11 @@ def submit_workflow(
     report_step(f"submitting {workflow} to RunPod endpoint {endpoint.id}...")
     run_id = generate_run_id()
     payload = build_job_payload(
-        config, run_id=run_id, command=command, workflow=workflow
+        config,
+        run_id=run_id,
+        command=command,
+        workflow=workflow,
+        setup_command=setup_command,
     )
     job = client.run_job(endpoint.id, payload)
     reference = RunReference(
@@ -3715,7 +3928,14 @@ def download_core_run_files(
     return downloaded
 
 
-def stream_logs(config: ProjectConfig, reference: RunReference, *, follow: bool) -> str:
+def stream_logs(
+    config: ProjectConfig,
+    reference: RunReference,
+    *,
+    follow: bool,
+    interactive: bool | None = None,
+    live_dashboard: bool = True,
+) -> str:
     client = load_runpod_client(config)
     volume = resolve_runpod_volume(config, client)
     report_step(
@@ -3723,6 +3943,34 @@ def stream_logs(config: ProjectConfig, reference: RunReference, *, follow: bool)
         f"({volume.data_center_id or 'unknown-dc'})..."
     )
     s3 = build_s3_client(config, volume)
+    renderer = create_run_renderer(
+        reference,
+        follow=follow,
+        interactive=interactive if live_dashboard else False,
+    )
+
+    with renderer:
+        return _stream_logs(
+            config,
+            reference,
+            follow=follow,
+            client=client,
+            volume=volume,
+            s3=s3,
+            renderer=renderer,
+        )
+
+
+def _stream_logs(
+    config: ProjectConfig,
+    reference: RunReference,
+    *,
+    follow: bool,
+    client: Any,
+    volume: VolumeHandle,
+    s3: Any,
+    renderer: PlainRunRenderer | LiveRunRenderer,
+) -> str:
 
     bootstrap_key = remote_state_file_key(config, WORKER_BOOTSTRAP_LOG_FILENAME)
     status_key = remote_run_file_key(config, reference.run_id, "status.json")
@@ -3750,9 +3998,9 @@ def stream_logs(config: ProjectConfig, reference: RunReference, *, follow: bool)
             chunk = bootstrap_text
         if chunk:
             if not announced_bootstrap:
-                report_remote_stream("worker bootstrap log")
+                renderer.announce_stream("worker bootstrap log")
                 announced_bootstrap = True
-            click.echo(chunk, nl=False)
+            renderer.write(chunk)
             has_remote_output = True
             saw_output_this_iteration = True
         last_bootstrap = bootstrap_text
@@ -3775,9 +4023,9 @@ def stream_logs(config: ProjectConfig, reference: RunReference, *, follow: bool)
                     text = str(output.get("text", ""))
                     if text:
                         if not announced_stream:
-                            report_remote_stream("worker output")
+                            renderer.announce_stream("worker output")
                             announced_stream = True
-                        click.echo(text, nl=False, err=(stream_name == "stderr"))
+                        renderer.write(text, err=(stream_name == "stderr"))
                         has_remote_output = True
                         saw_output_this_iteration = True
 
@@ -3837,19 +4085,17 @@ def stream_logs(config: ProjectConfig, reference: RunReference, *, follow: bool)
         ):
             should_report = True
 
-        if should_report:
-            report_poll_status(
+        if renderer.interactive or should_report:
+            renderer.update(
                 reference,
                 status,
                 has_remote_output=has_remote_output,
                 elapsed_seconds=elapsed_seconds,
-                detail=queue_diagnostics.progress_summary if status == "IN_QUEUE" else None,
+                queue_diagnostics=queue_diagnostics,
+                gpu_supply=gpu_supply,
+                data_center_id=volume.data_center_id,
             )
-            if status == "IN_QUEUE":
-                report_gpu_supply_dashboard(
-                    gpu_supply,
-                    data_center_id=volume.data_center_id,
-                )
+        if should_report:
             last_reported_status = status
             last_progress_at = now_monotonic
 
@@ -3943,6 +4189,7 @@ def pull_run(
             destination,
             manifest_text=manifest_text,
         )
+        download_core_run_files(s3, volume.id, prefix, destination)
         return destination
 
     downloaded = download_core_run_files(s3, volume.id, prefix, destination)
@@ -3960,7 +4207,13 @@ def pull_run(
     return destination
 
 
-def run_command(config: ProjectConfig, command_parts: tuple[str, ...]) -> int:
+def run_command(
+    config: ProjectConfig,
+    command_parts: tuple[str, ...],
+    *,
+    setup_command: str | None,
+    interactive: bool | None = None,
+) -> int:
     click.echo(f"syncing {config.name} -> {config.runtime.project_dir}")
     volume, uploaded, deleted = sync_project(config)
     click.echo(
@@ -3969,19 +4222,53 @@ def run_command(config: ProjectConfig, command_parts: tuple[str, ...]) -> int:
     )
     _command, workflow = resolve_run_command(config, command_parts, config.root)
     click.echo(f"submitting {workflow}")
-    reference, endpoint = submit_workflow(config, command_parts)
+    reference, endpoint = submit_workflow(
+        config,
+        command_parts,
+        setup_command=setup_command,
+    )
     click.echo(f"run_id: {reference.run_id}")
     click.echo(f"job_id: {reference.job_id}")
     click.echo(f"endpoint_id: {endpoint.id}")
     click.echo("polling RunPod job status and streaming remote worker logs...")
-    status = stream_logs(config, reference, follow=True)
+    status = stream_logs(
+        config,
+        reference,
+        follow=True,
+        interactive=interactive,
+    )
     click.echo(f"pulling artifacts for {reference.run_id}")
     pull_run(config, run_id=reference.run_id)
     return 0 if status == "COMPLETED" else 1
 
 
-def run_named_workflow(config: ProjectConfig, workflow: str) -> int:
-    return run_command(config, (workflow,))
+def run_named_workflow(
+    config: ProjectConfig,
+    workflow: str,
+    *,
+    interactive: bool | None = None,
+) -> int:
+    return run_command(
+        config,
+        (workflow,),
+        setup_command=config.runtime.setup_command,
+        interactive=interactive,
+    )
+
+
+def resolve_cli_setup_command(
+    config: ProjectConfig,
+    *,
+    setup_command: str | None,
+    no_setup: bool,
+) -> str | None:
+    if setup_command is not None and no_setup:
+        raise QuadraError("--setup-command and --no-setup cannot be used together.")
+    if no_setup:
+        return None
+    if setup_command is not None:
+        return setup_command
+    return config.runtime.setup_command
 
 
 @click.group(cls=BannerGroup, context_settings={"help_option_names": ["-h", "--help"]})
@@ -4131,11 +4418,36 @@ def sync() -> None:
 
 @cli.command(context_settings={"ignore_unknown_options": True})
 @click.argument("command_parts", nargs=-1, required=True, type=click.UNPROCESSED)
-def submit(command_parts: tuple[str, ...]) -> None:
+@click.option(
+    "--setup-command",
+    help=(
+        "Override the configured setup command for this run. "
+        "Place before the workload command."
+    ),
+)
+@click.option(
+    "--no-setup",
+    is_flag=True,
+    help="Disable the configured setup command for this run.",
+)
+def submit(
+    command_parts: tuple[str, ...],
+    setup_command: str | None,
+    no_setup: bool,
+) -> None:
     """Submit a workflow to the configured RunPod Serverless endpoint."""
     try:
         config = load_runnable_project()
-        reference, endpoint = submit_workflow(config, command_parts)
+        effective_setup_command = resolve_cli_setup_command(
+            config,
+            setup_command=setup_command,
+            no_setup=no_setup,
+        )
+        reference, endpoint = submit_workflow(
+            config,
+            command_parts,
+            setup_command=effective_setup_command,
+        )
     except QuadraError as exc:
         raise click.ClickException(str(exc)) from exc
 
@@ -4169,14 +4481,35 @@ def submit(command_parts: tuple[str, ...]) -> None:
         "Repeatable; paired with --fork by position."
     ),
 )
+@click.option(
+    "--setup-command",
+    help=(
+        "Override the configured setup command for this run. "
+        "Place before the workload command."
+    ),
+)
+@click.option(
+    "--no-setup",
+    is_flag=True,
+    help="Disable the configured setup command for this run.",
+)
+@click.option("--plain", is_flag=True, help="Disable the live terminal dashboard.")
 def run(
     command_parts: tuple[str, ...],
     fork_urls: tuple[str, ...],
     fork_packages: tuple[str, ...],
+    setup_command: str | None,
+    no_setup: bool,
+    plain: bool,
 ) -> None:
     """Sync, run a command remotely, stream logs, and pull artifacts."""
     try:
         config = load_runnable_project()
+        effective_setup_command = resolve_cli_setup_command(
+            config,
+            setup_command=setup_command,
+            no_setup=no_setup,
+        )
         if len(fork_packages) > len(fork_urls):
             raise QuadraError(
                 "More --fork-package values than --fork URLs were provided."
@@ -4186,7 +4519,12 @@ def run(
             for index, fork_url in enumerate(fork_urls)
         ]
         apply_fork_specs(config, fork_specs)
-        code = run_command(config, command_parts)
+        code = run_command(
+            config,
+            command_parts,
+            setup_command=effective_setup_command,
+            interactive=False if plain else None,
+        )
     except QuadraError as exc:
         raise click.ClickException(str(exc)) from exc
 
@@ -4236,14 +4574,23 @@ def fork(fork_url: str, package_name: str | None) -> None:
 
 @cli.command()
 @click.option(
-    "--follow/--no-follow", default=True, help="Poll until the job completes."
+    "--follow/--no-follow",
+    default=False,
+    help="Poll until the job completes instead of fetching the current logs once.",
 )
-def logs(follow: bool) -> None:
-    """Stream logs for the most recently submitted run."""
+@click.option("--plain", is_flag=True, help="Disable the live terminal dashboard.")
+def logs(follow: bool, plain: bool) -> None:
+    """Fetch logs for the most recently submitted run."""
     try:
         config = load_runnable_project()
         reference = load_last_run(config)
-        status = stream_logs(config, reference, follow=follow)
+        status = stream_logs(
+            config,
+            reference,
+            follow=follow,
+            interactive=False if plain else None,
+            live_dashboard=False,
+        )
     except QuadraError as exc:
         raise click.ClickException(str(exc)) from exc
 
@@ -4272,11 +4619,16 @@ def pull(run_id: str | None, destination: str | None) -> None:
 
 
 @cli.command()
-def smoke() -> None:
+@click.option("--plain", is_flag=True, help="Disable the live terminal dashboard.")
+def smoke(plain: bool) -> None:
     """Sync, submit, stream logs, and pull artifacts for the smoke workflow."""
     try:
         config = load_runnable_project()
-        code = run_named_workflow(config, "smoke")
+        code = run_named_workflow(
+            config,
+            "smoke",
+            interactive=False if plain else None,
+        )
     except QuadraError as exc:
         raise click.ClickException(str(exc)) from exc
 
