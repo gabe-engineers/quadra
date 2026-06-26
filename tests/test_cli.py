@@ -2945,7 +2945,7 @@ class QuadraCLITestCase(unittest.TestCase):
 
             fake_s3 = FakeS3Client()
             fake_client = StuckQueuedFakeRunpodClient(fake_s3)
-            queued_since = datetime.now(timezone.utc) - timedelta(seconds=301)
+            queued_since = datetime.now(timezone.utc) - timedelta(seconds=901)
 
             with chdir("bonsai"):
                 with patch("quadra.cli.load_runpod_client", return_value=fake_client):

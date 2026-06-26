@@ -149,6 +149,9 @@ The scaffolded default uses a public CUDA-enabled `pytorch/pytorch` runtime imag
 
 `timeout_seconds` in `runtime.runpod` is applied to the endpoint execution timeout when Quadra creates the endpoint.
 
+Quadra waits up to 15 minutes for a RunPod job to leave the queue. Set
+`QUADRA_RUNPOD_QUEUE_TIMEOUT_SECONDS` to override this queue timeout.
+
 ## Build And Install
 
 Build the package distributions with:
