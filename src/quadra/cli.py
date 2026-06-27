@@ -7,7 +7,6 @@ import logging
 import os
 import posixpath
 import re
-import shutil
 import subprocess
 import sys
 import textwrap
@@ -211,6 +210,7 @@ DEFAULT_SETUP_COMMAND = textwrap.dedent(
     uv_runtime_path="{project_dir}/.quadra/uv-runtime"
     uv_python="$uv_runtime_path/bin/python"
     uv_site_packages="{project_dir}/.quadra/uv-site-packages"
+    export UV_LINK_MODE="${UV_LINK_MODE:-copy}"
     if command -v uv >/dev/null 2>&1; then
       cd "{experiment_dir}" && "$(command -v uv)" sync
     elif PYTHONPATH="$uv_site_packages${PYTHONPATH:+:$PYTHONPATH}" python -m uv --version >/dev/null 2>&1; then
@@ -1682,6 +1682,27 @@ def load_project(start: Path | None = None) -> ProjectConfig:
     return build_project_config(root, data)
 
 
+def pyproject_declares_python_project(pyproject_path: Path) -> bool:
+    if not pyproject_path.exists():
+        return False
+    try:
+        data = tomllib.loads(pyproject_path.read_text(encoding="utf-8"))
+    except (OSError, tomllib.TOMLDecodeError):
+        return False
+
+    if isinstance(data.get("project"), dict):
+        return True
+    if isinstance(data.get("build-system"), dict):
+        return True
+    if isinstance(data.get("dependency-groups"), dict):
+        return True
+
+    tool = data.get("tool")
+    if not isinstance(tool, dict):
+        return False
+    return any(isinstance(tool.get(name), dict) for name in ("uv", "poetry", "pdm", "hatch"))
+
+
 def load_runnable_project(start: Path | None = None) -> ProjectConfig:
     try:
         return load_project(start)
@@ -1690,7 +1711,7 @@ def load_runnable_project(start: Path | None = None) -> ProjectConfig:
             raise
 
     root = (start or Path.cwd()).resolve()
-    setup_command = DEFAULT_SETUP_COMMAND if (root / "pyproject.toml").exists() else None
+    setup_command = DEFAULT_SETUP_COMMAND if pyproject_declares_python_project(root / "pyproject.toml") else None
     data: dict[str, Any] = {
         "schema_version": CONFIG_SCHEMA_VERSION,
         "project": {"name": root.name},
@@ -1865,306 +1886,7 @@ def render_experiment_pyproject(project_name: str) -> str:
 
 
 def render_project_worker_py() -> str:
-    return textwrap.dedent(
-        """\
-        from __future__ import annotations
-
-        import json
-        import os
-        import subprocess
-        import sys
-        import time
-        from pathlib import Path
-        from typing import Any
-
-        WORKER_BOOTSTRAP_LOG_PATH = Path(__file__).resolve().parent / ".quadra" / "worker-bootstrap.log"
-        RUN_MANIFEST_FILENAME = "run-manifest.json"
-
-        try:
-            import runpod
-        except ImportError:
-            subprocess.check_call(
-                [
-                    sys.executable,
-                    "-m",
-                    "pip",
-                    "install",
-                    "--disable-pip-version-check",
-                    "--no-cache-dir",
-                    "runpod",
-                ]
-            )
-            import runpod
-
-
-        def _now() -> str:
-            return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-
-
-        def _append_bootstrap_log(message: str) -> None:
-            WORKER_BOOTSTRAP_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
-            with WORKER_BOOTSTRAP_LOG_PATH.open("a", encoding="utf-8") as handle:
-                handle.write(f"[runpod worker] {_now()} {message}\\n")
-
-
-        def _write_status(path: Path, payload: dict[str, Any]) -> None:
-            path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_text(
-                json.dumps(payload, indent=2, sort_keys=True) + "\\n",
-                encoding="utf-8",
-            )
-
-
-        def _write_run_manifest(path: Path, *, run_dir: Path, run_id: str, status: str) -> None:
-            files = sorted(
-                file_path.relative_to(run_dir).as_posix()
-                for file_path in run_dir.rglob("*")
-                if file_path.is_file() and file_path.name != RUN_MANIFEST_FILENAME
-            )
-            path.write_text(
-                json.dumps(
-                    {{
-                        "run_id": run_id,
-                        "status": status,
-                        "files": files,
-                    }},
-                    indent=2,
-                    sort_keys=True,
-                )
-                + "\\n",
-                encoding="utf-8",
-            )
-
-
-        def _persist_run_state(
-            *,
-            run_dir: Path,
-            run_id: str,
-            status_path: Path,
-            manifest_path: Path,
-            status_payload: dict[str, Any],
-        ) -> None:
-            _write_status(status_path, status_payload)
-            _write_run_manifest(
-                manifest_path,
-                run_dir=run_dir,
-                run_id=run_id,
-                status=str(status_payload.get("status", "unknown")),
-            )
-
-
-        def _run_shell(
-            command: str,
-            *,
-            cwd: Path,
-            env: dict[str, str],
-            stdout_path: Path,
-            stderr_path: Path,
-        ) -> subprocess.CompletedProcess[str]:
-            stdout_path.parent.mkdir(parents=True, exist_ok=True)
-            stderr_path.parent.mkdir(parents=True, exist_ok=True)
-            with stdout_path.open("a", encoding="utf-8") as stdout_handle:
-                with stderr_path.open("a", encoding="utf-8") as stderr_handle:
-                    return subprocess.run(
-                        ["/bin/sh", "-lc", command],
-                        cwd=str(cwd),
-                        env=env,
-                        stdout=stdout_handle,
-                        stderr=stderr_handle,
-                        text=True,
-                        check=False,
-                    )
-
-
-        def handler(job: dict[str, Any]) -> dict[str, Any]:
-            payload = (job or {}).get("input") or {}
-            spec = payload.get("quadra") if isinstance(payload.get("quadra"), dict) else payload
-            _append_bootstrap_log("handler invoked")
-
-            required = [
-                "project_name",
-                "run_id",
-                "project_dir",
-                "experiment_dir",
-                "run_dir",
-                "command",
-            ]
-            missing = [key for key in required if not spec.get(key)]
-            if missing:
-                raise ValueError(
-                    f"Missing required Quadra payload fields: {', '.join(missing)}"
-                )
-
-            project_name = str(spec["project_name"])
-            run_id = str(spec["run_id"])
-            workflow = str(spec.get("workflow", spec["command"]))
-            project_dir = Path(str(spec["project_dir"]))
-            experiment_dir = Path(str(spec["experiment_dir"]))
-            run_dir = Path(str(spec["run_dir"]))
-            artifacts_dir = Path(str(spec.get("artifacts_dir", run_dir / "artifacts")))
-            stdout_path = run_dir / "stdout.log"
-            stderr_path = run_dir / "stderr.log"
-            status_path = run_dir / "status.json"
-            manifest_path = run_dir / RUN_MANIFEST_FILENAME
-
-            run_dir.mkdir(parents=True, exist_ok=True)
-            artifacts_dir.mkdir(parents=True, exist_ok=True)
-            stdout_path.touch()
-            stderr_path.touch()
-
-            env = os.environ.copy()
-            env.update({str(key): str(value) for key, value in (spec.get("env") or {}).items()})
-
-            status_payload = {
-                "project_name": project_name,
-                "run_id": run_id,
-                "workflow": workflow,
-                "project_dir": str(project_dir),
-                "experiment_dir": str(experiment_dir),
-                "run_dir": str(run_dir),
-                "artifacts_dir": str(artifacts_dir),
-                "status": "running",
-                "started_at": _now(),
-                "setup_command": spec.get("setup_command"),
-                "command": spec["command"],
-            }
-            _persist_run_state(
-                run_dir=run_dir,
-                run_id=run_id,
-                status_path=status_path,
-                manifest_path=manifest_path,
-                status_payload=status_payload,
-            )
-
-            if not project_dir.exists():
-                status_payload.update(
-                    {
-                        "status": "failed",
-                        "step": "prepare",
-                        "finished_at": _now(),
-                        "error": f"Project directory does not exist: {project_dir}",
-                    }
-                )
-                _persist_run_state(
-                    run_dir=run_dir,
-                    run_id=run_id,
-                    status_path=status_path,
-                    manifest_path=manifest_path,
-                    status_payload=status_payload,
-                )
-                raise RuntimeError(status_payload["error"])
-
-            if not experiment_dir.exists():
-                status_payload.update(
-                    {
-                        "status": "failed",
-                        "step": "prepare",
-                        "finished_at": _now(),
-                        "error": f"Experiment directory does not exist: {experiment_dir}",
-                    }
-                )
-                _persist_run_state(
-                    run_dir=run_dir,
-                    run_id=run_id,
-                    status_path=status_path,
-                    manifest_path=manifest_path,
-                    status_payload=status_payload,
-                )
-                raise RuntimeError(status_payload["error"])
-
-            setup_command = spec.get("setup_command")
-            if setup_command:
-                setup_result = _run_shell(
-                    str(setup_command),
-                    cwd=project_dir,
-                    env=env,
-                    stdout_path=stdout_path,
-                    stderr_path=stderr_path,
-                )
-                if setup_result.returncode != 0:
-                    status_payload.update(
-                        {
-                            "status": "failed",
-                            "step": "setup",
-                            "finished_at": _now(),
-                            "exit_code": setup_result.returncode,
-                            "error": (
-                                "Setup command failed with exit code "
-                                f"{setup_result.returncode}"
-                            ),
-                        }
-                    )
-                    _persist_run_state(
-                        run_dir=run_dir,
-                        run_id=run_id,
-                        status_path=status_path,
-                        manifest_path=manifest_path,
-                        status_payload=status_payload,
-                    )
-                    raise RuntimeError(status_payload["error"])
-
-            command_result = _run_shell(
-                str(spec["command"]),
-                cwd=experiment_dir,
-                env=env,
-                stdout_path=stdout_path,
-                stderr_path=stderr_path,
-            )
-            if command_result.returncode != 0:
-                status_payload.update(
-                    {
-                        "status": "failed",
-                        "step": "command",
-                        "finished_at": _now(),
-                        "exit_code": command_result.returncode,
-                        "error": (
-                            "Command failed with exit code "
-                            f"{command_result.returncode}"
-                        ),
-                    }
-                )
-                _persist_run_state(
-                    run_dir=run_dir,
-                    run_id=run_id,
-                    status_path=status_path,
-                    manifest_path=manifest_path,
-                    status_payload=status_payload,
-                )
-                raise RuntimeError(status_payload["error"])
-
-            status_payload.update(
-                {
-                    "status": "completed",
-                    "finished_at": _now(),
-                    "exit_code": 0,
-                }
-            )
-            _persist_run_state(
-                run_dir=run_dir,
-                run_id=run_id,
-                status_path=status_path,
-                manifest_path=manifest_path,
-                status_payload=status_payload,
-            )
-            return {
-                "run_id": run_id,
-                "status": "completed",
-                "run_dir": str(run_dir),
-                "artifacts_dir": str(artifacts_dir),
-            }
-
-
-        if __name__ == "__main__":
-            _append_bootstrap_log("worker process starting")
-            runpod_env_keys = sorted(key for key in os.environ if key.startswith("RUNPOD"))
-            _append_bootstrap_log(
-                f"runpod env keys: {', '.join(runpod_env_keys) or '<none>'}"
-            )
-            _append_bootstrap_log("imported runpod")
-            _append_bootstrap_log("starting runpod.serverless.start")
-            runpod.serverless.start({"handler": handler})
-        """
-    )
+    return importlib.resources.files("quadra").joinpath("serverless_worker.py").read_text(encoding="utf-8")
 
 
 def render_main_py(project_name: str) -> str:

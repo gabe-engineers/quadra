@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import select
+import shutil
 import subprocess
 import sys
 import time
@@ -75,6 +76,59 @@ def _persist_run_state(
     )
 
 
+def _disk_usage(path: Path) -> dict[str, int | str]:
+    candidate = path
+    while not candidate.exists() and candidate != candidate.parent:
+        candidate = candidate.parent
+    usage = shutil.disk_usage(candidate)
+    return {
+        "path": str(path),
+        "measured_path": str(candidate),
+        "total_bytes": usage.total,
+        "used_bytes": usage.used,
+        "free_bytes": usage.free,
+    }
+
+
+def _disk_usage_snapshot(*, project_dir: Path, run_dir: Path) -> dict[str, dict[str, int | str]]:
+    return {
+        "container_root": _disk_usage(Path("/")),
+        "project_dir": _disk_usage(project_dir),
+        "run_dir": _disk_usage(run_dir),
+    }
+
+
+def _write_stream_line(
+    *,
+    line: str,
+    stream: str,
+    stdout_path: Path,
+    stderr_path: Path,
+) -> dict[str, str]:
+    path = stderr_path if stream == "stderr" else stdout_path
+    stdio = sys.stderr if stream == "stderr" else sys.stdout
+    with path.open("a", encoding="utf-8") as handle:
+        handle.write(line)
+        handle.flush()
+    stdio.write(line)
+    stdio.flush()
+    return {"stream": stream, "text": line}
+
+
+def _worker_log(
+    message: str,
+    *,
+    stdout_path: Path,
+    stderr_path: Path,
+) -> dict[str, str]:
+    return _write_stream_line(
+        line=f"[quadra worker] {_now()} {message}\n",
+        stream="stdout",
+        stdout_path=stdout_path,
+        stderr_path=stderr_path,
+    )
+
+
 def _run_streaming(
     command: str,
     *,
@@ -82,6 +136,8 @@ def _run_streaming(
     env: dict[str, str],
     stdout_path: Path,
     stderr_path: Path,
+    label: str,
+    timestamp_output: bool = False,
 ) -> Generator[dict[str, str], None, int]:
     stdout_path.parent.mkdir(parents=True, exist_ok=True)
     stderr_path.parent.mkdir(parents=True, exist_ok=True)
@@ -103,6 +159,8 @@ def _run_streaming(
                     if fd == stdout_fd:
                         line = proc.stdout.readline()
                         if line:
+                            if timestamp_output:
+                                line = f"[quadra {label} {_now()}] {line}"
                             stdout_file.write(line)
                             stdout_file.flush()
                             sys.stdout.write(line)
@@ -111,6 +169,8 @@ def _run_streaming(
                     elif fd == stderr_fd:
                         line = proc.stderr.readline()
                         if line:
+                            if timestamp_output:
+                                line = f"[quadra {label} {_now()}] {line}"
                             stderr_file.write(line)
                             stderr_file.flush()
                             sys.stderr.write(line)
@@ -118,12 +178,20 @@ def _run_streaming(
                             yield {"stream": "stderr", "text": line}
                 if proc.poll() is not None:
                     for line in proc.stdout:
+                        if timestamp_output:
+                            line = f"[quadra {label} {_now()}] {line}"
                         stdout_file.write(line)
+                        stdout_file.flush()
                         sys.stdout.write(line)
+                        sys.stdout.flush()
                         yield {"stream": "stdout", "text": line}
                     for line in proc.stderr:
+                        if timestamp_output:
+                            line = f"[quadra {label} {_now()}] {line}"
                         stderr_file.write(line)
+                        stderr_file.flush()
                         sys.stderr.write(line)
+                        sys.stderr.flush()
                         yield {"stream": "stderr", "text": line}
                     break
     return proc.returncode
@@ -204,6 +272,7 @@ def handler(job: dict[str, Any]) -> Generator[dict[str, str], None, dict[str, An
         "run_dir": str(run_dir),
         "artifacts_dir": str(artifacts_dir),
         "status": "running",
+        "step": "prepare",
         "started_at": _now(),
         "setup_command": spec.get("setup_command"),
         "command": spec["command"],
@@ -214,6 +283,11 @@ def handler(job: dict[str, Any]) -> Generator[dict[str, str], None, dict[str, An
         status_path=status_path,
         manifest_path=manifest_path,
         status_payload=status_payload,
+    )
+    yield _worker_log(
+        f"prepared run directory at {run_dir}",
+        stdout_path=stdout_path,
+        stderr_path=stderr_path,
     )
 
     if not project_dir.exists():
@@ -240,14 +314,35 @@ def handler(job: dict[str, Any]) -> Generator[dict[str, str], None, dict[str, An
             error=f"Experiment directory does not exist: {experiment_dir}",
         )
 
+    status_payload.update(
+        {
+            "step": "setup",
+            "setup_started_at": _now(),
+            "disk_usage_before_setup": _disk_usage_snapshot(project_dir=project_dir, run_dir=run_dir),
+        }
+    )
+    _persist_run_state(
+        run_dir=run_dir,
+        run_id=run_id,
+        status_path=status_path,
+        manifest_path=manifest_path,
+        status_payload=status_payload,
+    )
     setup_command = spec.get("setup_command")
     if setup_command:
+        yield _worker_log(
+            f"starting setup command: {setup_command}",
+            stdout_path=stdout_path,
+            stderr_path=stderr_path,
+        )
         setup_rc = yield from _run_streaming(
             str(setup_command),
             cwd=project_dir,
             env=env,
             stdout_path=stdout_path,
             stderr_path=stderr_path,
+            label="setup",
+            timestamp_output=True,
         )
         if setup_rc != 0:
             return _fail(
@@ -260,13 +355,46 @@ def handler(job: dict[str, Any]) -> Generator[dict[str, str], None, dict[str, An
                 exit_code=setup_rc,
                 error=f"Setup command failed with exit code {setup_rc}",
             )
+        yield _worker_log(
+            f"finished setup command with exit code {setup_rc}",
+            stdout_path=stdout_path,
+            stderr_path=stderr_path,
+        )
+    else:
+        yield _worker_log(
+            "skipping setup command",
+            stdout_path=stdout_path,
+            stderr_path=stderr_path,
+        )
 
+    status_payload.update(
+        {
+            "setup_finished_at": _now(),
+            "setup_exit_code": 0,
+            "disk_usage_after_setup": _disk_usage_snapshot(project_dir=project_dir, run_dir=run_dir),
+            "step": "command",
+            "command_started_at": _now(),
+        }
+    )
+    _persist_run_state(
+        run_dir=run_dir,
+        run_id=run_id,
+        status_path=status_path,
+        manifest_path=manifest_path,
+        status_payload=status_payload,
+    )
+    yield _worker_log(
+        f"starting command: {spec['command']}",
+        stdout_path=stdout_path,
+        stderr_path=stderr_path,
+    )
     command_rc = yield from _run_streaming(
         str(spec["command"]),
         cwd=experiment_dir,
         env=env,
         stdout_path=stdout_path,
         stderr_path=stderr_path,
+        label="command",
     )
     if command_rc != 0:
         return _fail(
@@ -279,12 +407,20 @@ def handler(job: dict[str, Any]) -> Generator[dict[str, str], None, dict[str, An
             exit_code=command_rc,
             error=f"Command failed with exit code {command_rc}",
         )
+    yield _worker_log(
+        f"finished command with exit code {command_rc}",
+        stdout_path=stdout_path,
+        stderr_path=stderr_path,
+    )
 
     status_payload.update(
         {
             "status": "completed",
             "finished_at": _now(),
             "exit_code": 0,
+            "command_finished_at": _now(),
+            "command_exit_code": 0,
+            "disk_usage_after_command": _disk_usage_snapshot(project_dir=project_dir, run_dir=run_dir),
         }
     )
     _persist_run_state(

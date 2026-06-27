@@ -30,6 +30,7 @@ from quadra.cli import (
     load_project,
     resolve_runpod_volume,
 )
+from quadra import serverless_worker
 from quadra.runpod_rest import build_endpoint_create_body
 
 
@@ -1234,6 +1235,7 @@ class QuadraCLITestCase(unittest.TestCase):
                 'cd \\"{experiment_dir}\\" && \\"$uv_python\\" -m uv sync',
                 config,
             )
+            self.assertIn('export UV_LINK_MODE=\\"${UV_LINK_MODE:-copy}\\"', config)
             self.assertIn(
                 'PYTHONPATH=\\"$uv_site_packages${PYTHONPATH:+:$PYTHONPATH}\\" python -m uv sync',
                 config,
@@ -1272,7 +1274,61 @@ class QuadraCLITestCase(unittest.TestCase):
             )
             self.assertTrue((project_root / ".quadra").exists())
             self.assertTrue((project_root / "quadra_worker.py").exists())
+            worker = (project_root / "quadra_worker.py").read_text(encoding="utf-8")
+            self.assertIn("def _run_streaming(", worker)
+            self.assertIn("sys.stdout.write(line)", worker)
+            self.assertIn("sys.stderr.write(line)", worker)
+            self.assertIn('"return_aggregate_stream": True', worker)
             self.assertFalse((project_root / "src" / "experiment" / "scripts").exists())
+
+    def test_worker_streams_setup_and_command_to_stdio_and_files(self) -> None:
+        with self.runner.isolated_filesystem():
+            project_root = Path("project").resolve()
+            project_root.mkdir()
+            run_dir = project_root / "runs" / "run-1"
+            spec = {
+                "project_name": "project",
+                "run_id": "run-1",
+                "workflow": "smoke",
+                "project_dir": str(project_root),
+                "experiment_dir": str(project_root),
+                "run_dir": str(run_dir),
+                "setup_command": 'printf "setup out\\n"; printf "setup err\\n" >&2',
+                "command": 'printf "command out\\n"; printf "command err\\n" >&2',
+            }
+
+            generator = serverless_worker.handler({"input": {"quadra": spec}})
+            chunks = []
+            try:
+                while True:
+                    chunks.append(next(generator))
+            except StopIteration as stop:
+                result = stop.value
+
+            self.assertEqual(result["status"], "completed")
+            self.assertTrue(any(chunk["stream"] == "stdout" for chunk in chunks))
+            self.assertTrue(any(chunk["stream"] == "stderr" for chunk in chunks))
+
+            stdout = (run_dir / "stdout.log").read_text(encoding="utf-8")
+            stderr = (run_dir / "stderr.log").read_text(encoding="utf-8")
+            self.assertIn("[quadra worker]", stdout)
+            self.assertIn("starting setup command", stdout)
+            self.assertIn("[quadra setup ", stdout)
+            self.assertIn("setup out", stdout)
+            self.assertIn("finished setup command with exit code 0", stdout)
+            self.assertIn("starting command", stdout)
+            self.assertIn("command out", stdout)
+            self.assertIn("[quadra setup ", stderr)
+            self.assertIn("setup err", stderr)
+            self.assertIn("command err", stderr)
+
+            status = json.loads((run_dir / "status.json").read_text(encoding="utf-8"))
+            self.assertEqual(status["status"], "completed")
+            self.assertEqual(status["setup_exit_code"], 0)
+            self.assertEqual(status["command_exit_code"], 0)
+            self.assertIn("disk_usage_before_setup", status)
+            self.assertIn("disk_usage_after_setup", status)
+            self.assertIn("disk_usage_after_command", status)
 
     def test_init_without_name_uses_current_directory_name(self) -> None:
         with self.runner.isolated_filesystem():
@@ -2676,6 +2732,34 @@ class QuadraCLITestCase(unittest.TestCase):
                 'cd "/runpod-volume/projects/gemlite" && "$(command -v uv)" sync',
                 fake_client.submissions[0]["payload"]["quadra"]["setup_command"],
             )
+            self.assertIn(
+                'export UV_LINK_MODE="${UV_LINK_MODE:-copy}"',
+                fake_client.submissions[0]["payload"]["quadra"]["setup_command"],
+            )
+
+    def test_run_skips_default_setup_for_config_only_pyproject(self) -> None:
+        with self.runner.isolated_filesystem():
+            global_config = Path("global-quadra.toml").resolve()
+            self._write_global_config(global_config)
+            project_root = Path("diffusers")
+            project_root.mkdir()
+            (project_root / "pyproject.toml").write_text(
+                "[tool.ruff]\nline-length = 119\n",
+                encoding="utf-8",
+            )
+            (project_root / "main.py").write_text("print('ok')\n", encoding="utf-8")
+            fake_s3 = FakeS3Client()
+            fake_client = FakeRunpodClient(fake_s3)
+            fake_client.volume["name"] = "quadra-dev"
+
+            with patch.dict(os.environ, {"QUADRA_CONFIG": str(global_config)}):
+                with chdir(project_root):
+                    with patch("quadra.cli.load_runpod_client", return_value=fake_client):
+                        with patch("quadra.cli.build_s3_client", return_value=fake_s3):
+                            result = self.runner.invoke(cli, ["run", "python main.py"])
+
+            self.assertEqual(result.exit_code, 0, result.output)
+            self.assertIsNone(fake_client.submissions[0]["payload"]["quadra"]["setup_command"])
 
     def _write_global_config(self, path: Path) -> None:
         path.write_text(
